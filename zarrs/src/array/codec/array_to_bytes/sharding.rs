@@ -998,7 +998,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded.as_ref(), &[0, 2, 3, 4, 5, 15]);
-        assert_eq!(*input_handle.range_counts.lock().unwrap(), vec![1, 3]);
+        // Each encoded inner chunk is fetched independently so the store can
+        // issue the reads concurrently. The first call reads the shard index;
+        // the remaining three calls each contain one inner-chunk range.
+        assert_eq!(*input_handle.range_counts.lock().unwrap(), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn codec_sharding_partial_decode_subsets_per_chunk_separate_calls() {
+        // Test that requesting subsets across 4 distinct inner chunks generates
+        // exactly 4 separate single-range partial_decode_many calls (plus 1 for index).
+        let chunk_shape: ChunkShape = vec![NonZeroU64::new(4).unwrap(); 2];
+        let data_type = data_type::uint8();
+        let fill_value = FillValue::from(0u8);
+        let bytes: ArrayBytes = (0..chunk_shape.num_elements_usize() as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let codec_configuration: ShardingCodecConfiguration =
+            serde_json::from_str(JSON_VALID3).unwrap();
+        let codec = Arc::new(ShardingCodec::new_with_configuration(&codec_configuration).unwrap());
+        let options = CodecOptions::default().with_concurrent_target(4);
+        let encoded = codec
+            .encode(bytes, &chunk_shape, &data_type, &fill_value, &options)
+            .unwrap();
+        let input_handle = Arc::new(CountingPartialDecoder::new(encoded.into_owned().into()));
+        let partial_decoder = codec
+            .partial_decoder(
+                input_handle.clone(),
+                &chunk_shape,
+                &data_type,
+                &fill_value,
+                &options,
+            )
+            .unwrap();
+
+        // 4 subsets, each in a different inner chunk (subchunk_shape [2, 2]):
+        // chunk (0,0): [0..1, 0..1]
+        // chunk (0,1): [0..1, 2..3]
+        // chunk (1,0): [2..3, 0..1]
+        // chunk (1,1): [3..4, 3..4]
+        let subsets = vec![
+            ArraySubset::new_with_ranges(&[0..1, 0..1]),
+            ArraySubset::new_with_ranges(&[0..1, 2..3]),
+            ArraySubset::new_with_ranges(&[2..3, 0..1]),
+            ArraySubset::new_with_ranges(&[3..4, 3..4]),
+        ];
+        let decoded = partial_decoder
+            .partial_decode_subsets(&subsets, &options)
+            .unwrap()
+            .into_fixed()
+            .unwrap();
+
+        // Values at (0,0)=0, (0,2)=2, (2,0)=8, (3,3)=15
+        assert_eq!(decoded.as_ref(), &[0, 2, 8, 15]);
+        // 1 for shard index, plus 4 separate 1-range calls for the 4 inner chunks
+        assert_eq!(
+            *input_handle.range_counts.lock().unwrap(),
+            vec![1, 1, 1, 1, 1]
+        );
     }
 
     #[test]

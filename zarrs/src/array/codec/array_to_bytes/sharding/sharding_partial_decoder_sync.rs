@@ -407,34 +407,23 @@ fn partial_decode_fixed_array_subsets(
         }
     }
 
-    // Fetch every encoded inner chunk in one storage multi-range operation.
-    // The CPU decode remains a separate bounded phase below.
-    let byte_ranges = tasks.iter().filter_map(|task| task.encoded_range);
-    let Some(encoded_subchunks) =
-        input_handle.partial_decode_many(Box::new(byte_ranges), options)?
-    else {
+    // Each inner chunk fetches its own encoded bytes inside its own task, so
+    // reads are issued concurrently up to the codec concurrent limit.
+    //
+    // Batching every range of a shard into one `partial_decode_many` instead
+    // makes outstanding reads equal concurrent *shards* rather than
+    // concurrent *inner chunks*, because a store loops the ranges of one call
+    // sequentially. On a high-latency store that caps read depth far below
+    // what the storage rewards: for a scattered 1024-row CSR minibatch it is
+    // ~234 shards against ~2080 inner chunks. Stores that benefit from
+    // coalescing a shard's ranges should do so behind a file-handle cache.
+    if tasks.iter().all(|task| task.encoded_range.is_none()) {
         return Ok(ArrayBytes::new_fill_value(
             data_type,
             total_elements,
             fill_value,
         )?);
-    };
-    let mut encoded_subchunks = encoded_subchunks.into_iter();
-    let fetched_tasks = tasks
-        .into_iter()
-        .map(|task| {
-            let encoded = task.encoded_range.map(|_| {
-                ArrayBytesRaw::from(
-                    encoded_subchunks
-                        .next()
-                        .expect("one value per byte range")
-                        .into_owned(),
-                )
-            });
-            (task, encoded)
-        })
-        .collect::<Vec<_>>();
-    debug_assert!(encoded_subchunks.next().is_none());
+    }
 
     let output_len = subsets
         .iter()
@@ -466,7 +455,14 @@ fn partial_decode_fixed_array_subsets(
             options,
         )?;
 
-    let decode_task = |(task, encoded): (FixedSubchunkTask, Option<ArrayBytesRaw<'static>>)| {
+    let decode_task = |task: FixedSubchunkTask| {
+        let encoded = match task.encoded_range {
+            Some(byte_range) => input_handle
+                .partial_decode_many(Box::new(std::iter::once(byte_range)), options)?
+                .and_then(|subchunks| subchunks.into_iter().next())
+                .map(|bytes| ArrayBytesRaw::from(bytes.into_owned())),
+            None => None,
+        };
         let Some(encoded) = encoded else {
             for piece in task.pieces {
                 let mut output_view = unsafe {
@@ -521,12 +517,7 @@ fn partial_decode_fixed_array_subsets(
         Ok(())
     };
 
-    crate::iter_concurrent_limit!(
-        subchunk_concurrent_limit,
-        fetched_tasks,
-        try_for_each,
-        decode_task
-    )?;
+    crate::iter_concurrent_limit!(subchunk_concurrent_limit, tasks, try_for_each, decode_task)?;
     unsafe {
         // SAFETY: every byte is written by exactly one disjoint decoded or
         // fill-value piece before successful completion above.
