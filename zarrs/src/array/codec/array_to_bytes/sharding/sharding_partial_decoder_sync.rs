@@ -274,6 +274,60 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
                 subsets,
                 options,
                 data_type_size,
+                None,
+            )
+        } else {
+            self.partial_decode(&subsets, options)
+        }
+    }
+
+    fn subsets_read_plan(
+        &self,
+        subsets: &[ArraySubset],
+        _options: &CodecOptions,
+    ) -> Result<Option<Vec<Option<ByteRange>>>, CodecError> {
+        // Only the fixed-size path decodes per inner chunk; everything else
+        // falls back to `partial_decode_subsets`, so report no plan.
+        let (Some(shard_index), DataTypeSize::Fixed(_)) =
+            (self.shard_index.as_deref(), self.data_type.size())
+        else {
+            return Ok(None);
+        };
+        if subsets
+            .iter()
+            .any(|subset| subset.dimensionality() != self.shard_shape.len())
+        {
+            return Ok(None);
+        }
+        // Pure computation: the shard index is already resident.
+        let tasks = plan_fixed_subchunk_tasks(
+            &self.shard_shape,
+            &self.subchunk_shape,
+            shard_index,
+            subsets,
+        )?;
+        Ok(Some(tasks.iter().map(|task| task.encoded_range).collect()))
+    }
+
+    fn partial_decode_subsets_prefetched(
+        &self,
+        subsets: &[ArraySubset],
+        fetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        if let DataTypeSize::Fixed(data_type_size) = self.data_type.size() {
+            partial_decode_fixed_array_subsets(
+                &self.input_handle,
+                &self.data_type,
+                &self.fill_value,
+                &self.shard_shape,
+                &self.subchunk_shape,
+                &self.inner_codecs,
+                self.shard_index.as_deref(),
+                subsets,
+                options,
+                data_type_size,
+                Some(fetched),
             )
         } else {
             self.partial_decode(&subsets, options)
@@ -511,6 +565,10 @@ fn partial_decode_fixed_array_subsets(
     subsets: &[ArraySubset],
     options: &CodecOptions,
     data_type_size: usize,
+    // When the caller already fetched the encoded chunks (via
+    // `subsets_read_plan`), this call does no I/O at all: it is pure CPU and
+    // never parks a thread on storage.
+    prefetched: Option<Vec<Option<ArrayBytesRaw<'static>>>>,
 ) -> Result<ArrayBytes<'static>, CodecError> {
     let total_elements = subsets.iter().map(ArraySubset::num_elements).sum();
     let Some(shard_index) = shard_index else {
@@ -639,6 +697,18 @@ fn partial_decode_fixed_array_subsets(
     // is the only thing bounding CPU.
     let (tx_done, rx_done) = crossbeam_channel::unbounded();
     let submitted = tasks.len();
+    if let Some(prefetched) = prefetched {
+        if prefetched.len() != submitted {
+            return Err(CodecError::Other(format!(
+                "prefetched bytes ({}) do not match the read plan ({submitted})",
+                prefetched.len()
+            )));
+        }
+        for (index, (task, encoded)) in tasks.into_iter().zip(prefetched).enumerate() {
+            let _ = tx_done.send((index, task, Ok(encoded)));
+        }
+        drop(tx_done);
+    } else {
     for (index, task) in tasks.into_iter().enumerate() {
         match task.encoded_range {
             Some(byte_range) => {
@@ -664,6 +734,7 @@ fn partial_decode_fixed_array_subsets(
         }
     }
     drop(tx_done);
+    }
 
     // Decode each chunk the moment it lands. Collecting every completion
     // first would be a barrier: a shard could not start decompressing until

@@ -610,6 +610,55 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
         self.partial_decode(&subsets, options)
     }
 
+    /// Report the reads [`Self::partial_decode_subsets`] would perform, without
+    /// performing them.
+    ///
+    /// Returns one entry per unit of encoded input, in the order
+    /// [`Self::partial_decode_subsets_prefetched`] expects them back. [`None`]
+    /// marks a unit with nothing to read, which decodes to the fill value.
+    ///
+    /// This exists so a caller holding many decoders can build a single read
+    /// plan across all of them and schedule it as a whole. Without it, the only
+    /// way to overlap decoders is a thread per decoder parked on its own I/O
+    /// — threads that exist to work around the call shape rather than because
+    /// anything is unknown. For a sharding decoder with its shard index already
+    /// resident, the entire plan is pure computation.
+    ///
+    /// Returns [`None`] if this decoder cannot report its reads up front, in
+    /// which case the caller should use [`Self::partial_decode_subsets`].
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if a codec fails or an array subset is invalid.
+    fn subsets_read_plan(
+        &self,
+        subsets: &[ArraySubset],
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<Option<ByteRange>>>, CodecError> {
+        let _ = (subsets, options);
+        Ok(None)
+    }
+
+    /// Decode subsets from encoded bytes the caller already fetched.
+    ///
+    /// `fetched` must correspond one-to-one, and in order, with the plan
+    /// returned by [`Self::subsets_read_plan`] for the same `subsets`.
+    ///
+    /// The call performs no I/O, so it never parks a thread waiting on
+    /// storage; it is pure CPU and can be scheduled on a bounded pool.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if a codec fails, an array subset is invalid, or
+    /// `fetched` does not match the plan for `subsets`.
+    fn partial_decode_subsets_prefetched(
+        &self,
+        subsets: &[ArraySubset],
+        fetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        let _ = fetched;
+        self.partial_decode_subsets(subsets, options)
+    }
+
     /// Partially decode into a preallocated output.
     ///
     /// This method is intended for internal use by Array.

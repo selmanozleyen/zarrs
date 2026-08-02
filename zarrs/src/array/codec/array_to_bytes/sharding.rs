@@ -1059,6 +1059,82 @@ mod tests {
     }
 
     #[test]
+    fn codec_sharding_subsets_read_plan_prefetched() {
+        let chunk_shape: ChunkShape = vec![NonZeroU64::new(4).unwrap(); 2];
+        let data_type = data_type::uint8();
+        let fill_value = FillValue::from(0u8);
+        let bytes: ArrayBytes = (0..chunk_shape.num_elements_usize() as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let codec_configuration: ShardingCodecConfiguration =
+            serde_json::from_str(JSON_VALID3).unwrap();
+        let codec = Arc::new(ShardingCodec::new_with_configuration(&codec_configuration).unwrap());
+        let options = CodecOptions::default().with_concurrent_target(4);
+        let encoded = codec
+            .encode(bytes, &chunk_shape, &data_type, &fill_value, &options)
+            .unwrap();
+        let input_handle = Arc::new(CountingPartialDecoder::new(encoded.into_owned().into()));
+        let partial_decoder = codec
+            .clone()
+            .partial_decoder(
+                input_handle.clone(),
+                &chunk_shape,
+                &data_type,
+                &fill_value,
+                &options,
+            )
+            .unwrap();
+
+        let subsets = vec![
+            ArraySubset::new_with_ranges(&[0..1, 0..1]),
+            ArraySubset::new_with_ranges(&[0..1, 2..4]),
+            ArraySubset::new_with_ranges(&[1..2, 0..2]),
+            ArraySubset::new_with_ranges(&[3..4, 3..4]),
+        ];
+
+        // The plan is pure computation off the resident shard index.
+        let reads_before_plan = input_handle.range_counts.lock().unwrap().len();
+        let plan = partial_decoder
+            .subsets_read_plan(&subsets, &options)
+            .unwrap()
+            .expect("sharding reports its reads");
+        assert_eq!(
+            input_handle.range_counts.lock().unwrap().len(),
+            reads_before_plan,
+            "planning must not perform any reads"
+        );
+
+        // The caller does the I/O itself, in whatever order it likes.
+        let fetched = plan
+            .iter()
+            .map(|byte_range| {
+                byte_range.and_then(|byte_range| {
+                    input_handle
+                        .partial_decode(byte_range, &options)
+                        .unwrap()
+                        .map(|bytes| ArrayBytesRaw::from(bytes.into_owned()))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Decoding from those bytes performs no further reads at all.
+        let reads_before_decode = input_handle.range_counts.lock().unwrap().len();
+        let decoded = partial_decoder
+            .partial_decode_subsets_prefetched(&subsets, fetched, &options)
+            .unwrap()
+            .into_fixed()
+            .unwrap();
+        assert_eq!(
+            input_handle.range_counts.lock().unwrap().len(),
+            reads_before_decode,
+            "prefetched decode must not touch storage"
+        );
+
+        // And it agrees with the fetch-it-yourself path.
+        assert_eq!(decoded.as_ref(), &[0, 2, 3, 4, 5, 15]);
+    }
+
+    #[test]
     fn codec_sharding_compact() {
         // Test that compact removes gaps in sharded data
         // 1. Fully encode a shard
