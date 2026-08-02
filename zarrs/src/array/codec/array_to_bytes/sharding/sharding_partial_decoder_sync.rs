@@ -1,5 +1,5 @@
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use std::collections::HashMap;
 
@@ -339,6 +339,52 @@ struct FixedSubchunkTask {
 /// sees all of its sparse ranges in one call and can turn them into a single
 /// multi-range storage request.
 #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Admission control for the CPU half of a fetch-then-decode task.
+///
+/// Fetch and decode want opposite concurrency. A thread parked in `pread`
+/// costs no CPU, so every inner chunk should have its read outstanding at
+/// once. Decompression is CPU-bound, so admitting every completed read at
+/// once would oversubscribe the machine and turn the win into scheduler
+/// churn.
+///
+/// So reads fan out unbounded and a completed read waits here until a CPU
+/// slot frees: a task only proceeds when its bytes have arrived AND there is
+/// capacity to decode them. Waiting costs no CPU either, since the thread
+/// blocks on the condvar.
+struct DecodeGate {
+    slots: Mutex<usize>,
+    free: Condvar,
+}
+
+impl DecodeGate {
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: Mutex::new(slots.max(1)),
+            free: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> DecodePermit<'_> {
+        let mut slots = self.slots.lock().unwrap();
+        while *slots == 0 {
+            slots = self.free.wait(slots).unwrap();
+        }
+        *slots -= 1;
+        DecodePermit { gate: self }
+    }
+}
+
+struct DecodePermit<'a> {
+    gate: &'a DecodeGate,
+}
+
+impl Drop for DecodePermit<'_> {
+    fn drop(&mut self) {
+        *self.gate.slots.lock().unwrap() += 1;
+        self.gate.free.notify_one();
+    }
+}
+
 fn partial_decode_fixed_array_subsets(
     input_handle: &Arc<dyn BytesPartialDecoderTraits>,
     data_type: &DataType,
@@ -455,6 +501,10 @@ fn partial_decode_fixed_array_subsets(
             options,
         )?;
 
+    // `subchunk_concurrent_limit` now bounds DECODE admission only; fetches
+    // fan out over every task.
+    let decode_gate = DecodeGate::new(subchunk_concurrent_limit);
+
     let decode_task = |task: FixedSubchunkTask| {
         let encoded = match task.encoded_range {
             Some(byte_range) => input_handle
@@ -481,6 +531,8 @@ fn partial_decode_fixed_array_subsets(
             return Ok::<_, CodecError>(());
         };
 
+        // Bytes are here; wait for a CPU slot before decompressing.
+        let _permit = decode_gate.acquire();
         let inner_partial_decoder = inner_codecs.clone().partial_decoder(
             Arc::new(encoded),
             subchunk_shape,
@@ -517,7 +569,10 @@ fn partial_decode_fixed_array_subsets(
         Ok(())
     };
 
-    crate::iter_concurrent_limit!(subchunk_concurrent_limit, tasks, try_for_each, decode_task)?;
+    // Fetch fan-out is the task count, not the codec limit: reads should all
+    // be outstanding, and `decode_gate` is what keeps the CPU bounded.
+    let fetch_concurrent_limit = tasks.len().max(1);
+    crate::iter_concurrent_limit!(fetch_concurrent_limit, tasks, try_for_each, decode_task)?;
     unsafe {
         // SAFETY: every byte is written by exactly one disjoint decoded or
         // fill-value piece before successful completion above.
