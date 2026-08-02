@@ -1,6 +1,8 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use unsafe_cell_slice::UnsafeCellSlice;
@@ -237,6 +239,46 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
         )
     }
 
+    fn partial_decode_subsets(
+        &self,
+        subsets: &[ArraySubset],
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        if subsets.is_empty() {
+            return Ok(ArrayBytes::from(Vec::<u8>::new()));
+        }
+        if subsets
+            .iter()
+            .any(|subset| subset.dimensionality() != self.shard_shape.len())
+        {
+            return Err(IndexerError::new_incompatible_dimensionality(
+                subsets
+                    .iter()
+                    .find(|subset| subset.dimensionality() != self.shard_shape.len())
+                    .map_or(0, ArraySubset::dimensionality),
+                self.shard_shape.len(),
+            )
+            .into());
+        }
+
+        if let DataTypeSize::Fixed(data_type_size) = self.data_type.size() {
+            partial_decode_fixed_array_subsets(
+                &self.input_handle,
+                &self.data_type,
+                &self.fill_value,
+                &self.shard_shape,
+                &self.subchunk_shape,
+                &self.inner_codecs,
+                self.shard_index.as_deref(),
+                subsets,
+                options,
+                data_type_size,
+            )
+        } else {
+            self.partial_decode(&subsets, options)
+        }
+    }
+
     fn partial_decode_into(
         &self,
         indexer: &dyn Indexer,
@@ -275,6 +317,222 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
     fn supports_partial_decode(&self) -> bool {
         self.input_handle.supports_partial_decode()
     }
+}
+
+#[derive(Debug)]
+struct FixedSubsetPiece {
+    output_index: usize,
+    output_subset: ArraySubset,
+    subchunk_subset: ArraySubset,
+}
+
+#[derive(Debug)]
+struct FixedSubchunkTask {
+    chunk_indices: ArrayIndicesTinyVec,
+    pieces: Vec<FixedSubsetPiece>,
+    encoded_range: Option<ByteRange>,
+}
+
+/// Decode a structured list of subsets without flattening it to coordinates.
+///
+/// Subsets are grouped by inner chunk. Each inner partial decoder therefore
+/// sees all of its sparse ranges in one call and can turn them into a single
+/// multi-range storage request.
+#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+fn partial_decode_fixed_array_subsets(
+    input_handle: &Arc<dyn BytesPartialDecoderTraits>,
+    data_type: &DataType,
+    fill_value: &FillValue,
+    shard_shape: &[NonZeroU64],
+    subchunk_shape: &[NonZeroU64],
+    inner_codecs: &Arc<CodecChain>,
+    shard_index: Option<&[u64]>,
+    subsets: &[ArraySubset],
+    options: &CodecOptions,
+    data_type_size: usize,
+) -> Result<ArrayBytes<'static>, CodecError> {
+    let total_elements = subsets.iter().map(ArraySubset::num_elements).sum();
+    let Some(shard_index) = shard_index else {
+        return Ok(ArrayBytes::new_fill_value(
+            data_type,
+            total_elements,
+            fill_value,
+        )?);
+    };
+
+    let chunks_per_shard =
+        calculate_chunks_per_shard(shard_shape, subchunk_shape)?.to_array_shape();
+    let shard_chunk_grid = RegularChunkGrid::new(
+        bytemuck::must_cast_slice(shard_shape).to_vec(),
+        subchunk_shape.to_vec(),
+    )
+    .map_err(Into::<IncompatibleDimensionalityError>::into)?;
+
+    let mut tasks = Vec::<FixedSubchunkTask>::new();
+    let mut task_indices = HashMap::<u64, usize>::new();
+    for (output_index, subset) in subsets.iter().enumerate() {
+        let chunks = shard_chunk_grid.chunks_in_array_subset(subset)?;
+        for chunk_indices in chunks.indices() {
+            let chunk_index_1d =
+                ravel_indices(&chunk_indices, &chunks_per_shard).expect("inbounds chunk");
+            let task_index = *task_indices.entry(chunk_index_1d).or_insert_with(|| {
+                let task_index = tasks.len();
+                tasks.push(FixedSubchunkTask {
+                    chunk_indices: chunk_indices.clone(),
+                    pieces: Vec::new(),
+                    encoded_range: None,
+                });
+                task_index
+            });
+            let chunk_subset = shard_chunk_grid
+                .subset(&chunk_indices)
+                .expect("matching dimensionality");
+            let overlap = subset.overlap(&chunk_subset)?;
+            tasks[task_index].pieces.push(FixedSubsetPiece {
+                output_index,
+                output_subset: overlap.relative_to(subset.start())?,
+                subchunk_subset: overlap.relative_to(chunk_subset.start())?,
+            });
+        }
+    }
+
+    for task in &mut tasks {
+        let chunk_index_1d =
+            ravel_indices(&task.chunk_indices, &chunks_per_shard).expect("inbounds chunk");
+        let shard_index_idx = usize::try_from(chunk_index_1d).unwrap();
+        let offset = shard_index[shard_index_idx * 2];
+        let size = shard_index[shard_index_idx * 2 + 1];
+        if offset != u64::MAX || size != u64::MAX {
+            task.encoded_range = Some(ByteRange::FromStart(offset, Some(size)));
+        }
+    }
+
+    // Fetch every encoded inner chunk in one storage multi-range operation.
+    // The CPU decode remains a separate bounded phase below.
+    let byte_ranges = tasks.iter().filter_map(|task| task.encoded_range);
+    let Some(encoded_subchunks) =
+        input_handle.partial_decode_many(Box::new(byte_ranges), options)?
+    else {
+        return Ok(ArrayBytes::new_fill_value(
+            data_type,
+            total_elements,
+            fill_value,
+        )?);
+    };
+    let mut encoded_subchunks = encoded_subchunks.into_iter();
+    let fetched_tasks = tasks
+        .into_iter()
+        .map(|task| {
+            let encoded = task.encoded_range.map(|_| {
+                ArrayBytesRaw::from(
+                    encoded_subchunks
+                        .next()
+                        .expect("one value per byte range")
+                        .into_owned(),
+                )
+            });
+            (task, encoded)
+        })
+        .collect::<Vec<_>>();
+    debug_assert!(encoded_subchunks.next().is_none());
+
+    let output_len = subsets
+        .iter()
+        .map(|subset| subset.num_elements_usize() * data_type_size)
+        .sum();
+    let mut output = Vec::with_capacity(output_len);
+    let output_all = UnsafeCellSlice::new_from_vec_with_spare_capacity(&mut output);
+    let mut output_offset = 0;
+    let output_slices = subsets
+        .iter()
+        .map(|subset| {
+            let output_end = output_offset + subset.num_elements_usize() * data_type_size;
+            let slice = unsafe {
+                // SAFETY: subset byte intervals are disjoint and exactly tile
+                // the output allocation.
+                output_all.index_mut(output_offset..output_end)
+            };
+            output_offset = output_end;
+            UnsafeCellSlice::new(slice)
+        })
+        .collect::<Vec<_>>();
+    debug_assert_eq!(output_offset, output_len);
+    let (subchunk_concurrent_limit, inner_options) =
+        super::get_concurrent_target_and_codec_options(
+            inner_codecs,
+            data_type,
+            subchunk_shape,
+            &chunks_per_shard,
+            options,
+        )?;
+
+    let decode_task = |(task, encoded): (FixedSubchunkTask, Option<ArrayBytesRaw<'static>>)| {
+        let Some(encoded) = encoded else {
+            for piece in task.pieces {
+                let mut output_view = unsafe {
+                    // SAFETY: inner chunks intersect disjoint regions of each output subset.
+                    ArrayBytesFixedDisjointView::new(
+                        output_slices[piece.output_index],
+                        data_type_size,
+                        subsets[piece.output_index].shape(),
+                        piece.output_subset,
+                    )?
+                };
+                output_view
+                    .fill(fill_value.as_ne_bytes())
+                    .map_err(CodecError::from)?;
+            }
+            return Ok::<_, CodecError>(());
+        };
+
+        let inner_partial_decoder = inner_codecs.clone().partial_decoder(
+            Arc::new(encoded),
+            subchunk_shape,
+            data_type,
+            fill_value,
+            &inner_options,
+        )?;
+        let inner_subsets = task
+            .pieces
+            .iter()
+            .map(|piece| piece.subchunk_subset.clone())
+            .collect::<Vec<_>>();
+        let decoded = inner_partial_decoder
+            .partial_decode_subsets(&inner_subsets, &inner_options)?
+            .into_fixed()?;
+        let mut decoded_offset = 0;
+        for piece in task.pieces {
+            let decoded_length = piece.subchunk_subset.num_elements_usize() * data_type_size;
+            let mut output_view = unsafe {
+                // SAFETY: inner chunks intersect disjoint regions of each output subset.
+                ArrayBytesFixedDisjointView::new(
+                    output_slices[piece.output_index],
+                    data_type_size,
+                    subsets[piece.output_index].shape(),
+                    piece.output_subset,
+                )?
+            };
+            output_view
+                .copy_from_slice(&decoded[decoded_offset..decoded_offset + decoded_length])
+                .map_err(CodecError::from)?;
+            decoded_offset += decoded_length;
+        }
+        debug_assert_eq!(decoded_offset, decoded.len());
+        Ok(())
+    };
+
+    crate::iter_concurrent_limit!(
+        subchunk_concurrent_limit,
+        fetched_tasks,
+        try_for_each,
+        decode_task
+    )?;
+    unsafe {
+        // SAFETY: every byte is written by exactly one disjoint decoded or
+        // fill-value piece before successful completion above.
+        output.set_len(output_len);
+    }
+    Ok(output.into())
 }
 
 #[expect(clippy::too_many_arguments)]

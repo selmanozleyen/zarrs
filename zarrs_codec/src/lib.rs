@@ -593,6 +593,23 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError>;
 
+    /// Partially decode an ordered collection of array subsets.
+    ///
+    /// The returned bytes contain each subset in order, with the elements of
+    /// each subset in C order. Codecs may override this method to preserve the
+    /// subset structure and avoid expanding sparse selections into individual
+    /// element coordinates.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if a codec fails or an array subset is invalid.
+    fn partial_decode_subsets(
+        &self,
+        subsets: &[ArraySubset],
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        self.partial_decode(&subsets, options)
+    }
+
     /// Partially decode into a preallocated output.
     ///
     /// This method is intended for internal use by Array.
@@ -812,6 +829,15 @@ pub trait AsyncArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
         indexer: &dyn Indexer,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'a>, CodecError>;
+
+    /// Asynchronous variant of [`ArrayPartialDecoderTraits::partial_decode_subsets`].
+    async fn partial_decode_subsets<'a>(
+        &'a self,
+        subsets: &[ArraySubset],
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'a>, CodecError> {
+        self.partial_decode(&subsets, options).await
+    }
 
     /// Async variant of [`ArrayPartialDecoderTraits::partial_decode_into`].
     #[allow(clippy::missing_safety_doc)]

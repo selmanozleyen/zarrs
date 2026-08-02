@@ -189,7 +189,10 @@ impl CodecTraits for BloscCodec {
     fn partial_decoder_capability(&self) -> PartialDecoderCapability {
         PartialDecoderCapability {
             partial_read: false,
-            partial_decode: false, // TODO: the blosc codec technically supports partial decoding, but it needs coalescing to be efficient. So, use a cache for now
+            // Keep the encoded buffer cached, then use `blosc_getitem` for the
+            // requested decoded ranges instead of eagerly inflating the full
+            // inner chunk.
+            partial_decode: true,
         }
     }
 

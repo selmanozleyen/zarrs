@@ -290,9 +290,56 @@ mod tests {
 
     use super::*;
     use crate::array::codec::bytes_to_bytes::test_unbounded::TestUnboundedCodec;
-    use crate::array::{ArrayBytes, ArraySubset, data_type};
+    use crate::array::{ArrayBytes, ArrayBytesRaw, ArraySubset, data_type};
     use zarrs_chunk_grid::Indexer;
-    use zarrs_codec::{ArrayToBytesCodecTraits, BytesToBytesCodecTraits, CodecSpecificOptions};
+    use zarrs_codec::{
+        ArrayToBytesCodecTraits, BytesPartialDecoderTraits, BytesToBytesCodecTraits,
+        CodecSpecificOptions,
+    };
+    use zarrs_storage::StorageError;
+    use zarrs_storage::byte_range::ByteRangeIterator;
+
+    struct CountingPartialDecoder {
+        bytes: ArrayBytesRaw<'static>,
+        range_counts: Mutex<Vec<usize>>,
+    }
+
+    impl CountingPartialDecoder {
+        fn new(bytes: ArrayBytesRaw<'static>) -> Self {
+            Self {
+                bytes,
+                range_counts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BytesPartialDecoderTraits for CountingPartialDecoder {
+        fn exists(&self) -> Result<bool, StorageError> {
+            Ok(true)
+        }
+
+        fn size_held(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn partial_decode_many(
+            &self,
+            decoded_regions: ByteRangeIterator,
+            options: &CodecOptions,
+        ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
+            let decoded_regions = decoded_regions.collect::<Vec<_>>();
+            self.range_counts
+                .lock()
+                .unwrap()
+                .push(decoded_regions.len());
+            self.bytes
+                .partial_decode_many(Box::new(decoded_regions.into_iter()), options)
+        }
+
+        fn supports_partial_decode(&self) -> bool {
+            true
+        }
+    }
 
     fn get_concurrent_target(parallel: bool) -> usize {
         if parallel {
@@ -907,6 +954,51 @@ mod tests {
             .collect();
         let answer: Vec<u8> = vec![4, 8];
         assert_eq!(answer, decoded_partial_chunk);
+    }
+
+    #[test]
+    fn codec_sharding_partial_decode_subsets() {
+        let chunk_shape: ChunkShape = vec![NonZeroU64::new(4).unwrap(); 2];
+        let data_type = data_type::uint8();
+        let fill_value = FillValue::from(0u8);
+        let bytes: ArrayBytes = (0..chunk_shape.num_elements_usize() as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let codec_configuration: ShardingCodecConfiguration =
+            serde_json::from_str(JSON_VALID3).unwrap();
+        let codec = Arc::new(ShardingCodec::new_with_configuration(&codec_configuration).unwrap());
+        let options = CodecOptions::default().with_concurrent_target(4);
+        let encoded = codec
+            .encode(bytes, &chunk_shape, &data_type, &fill_value, &options)
+            .unwrap();
+        let input_handle = Arc::new(CountingPartialDecoder::new(encoded.into_owned().into()));
+        let partial_decoder = codec
+            .partial_decoder(
+                input_handle.clone(),
+                &chunk_shape,
+                &data_type,
+                &fill_value,
+                &options,
+            )
+            .unwrap();
+
+        // The first and third subsets share an inner chunk but are separated
+        // by another subset in output order. The decoder must group the I/O by
+        // inner chunk without changing the requested order.
+        let subsets = vec![
+            ArraySubset::new_with_ranges(&[0..1, 0..1]),
+            ArraySubset::new_with_ranges(&[0..1, 2..4]),
+            ArraySubset::new_with_ranges(&[1..2, 0..2]),
+            ArraySubset::new_with_ranges(&[3..4, 3..4]),
+        ];
+        let decoded = partial_decoder
+            .partial_decode_subsets(&subsets, &options)
+            .unwrap()
+            .into_fixed()
+            .unwrap();
+
+        assert_eq!(decoded.as_ref(), &[0, 2, 3, 4, 5, 15]);
+        assert_eq!(*input_handle.range_counts.lock().unwrap(), vec![1, 3]);
     }
 
     #[test]
