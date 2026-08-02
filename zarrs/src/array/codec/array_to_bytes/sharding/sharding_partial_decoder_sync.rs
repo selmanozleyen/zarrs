@@ -432,27 +432,24 @@ static IO_POOL: LazyLock<IoPool> = LazyLock::new(|| {
     IoPool::new(threads)
 });
 
-fn partial_decode_fixed_array_subsets(
-    input_handle: &Arc<dyn BytesPartialDecoderTraits>,
-    data_type: &DataType,
-    fill_value: &FillValue,
+/// Work out every inner-chunk read a multi-subset decode needs, without
+/// performing any of them.
+///
+/// This is pure computation against the already-resident shard index: which
+/// inner chunks are touched, where each lives in the shard, and which parts of
+/// which output subsets it fills. Nothing here is discovered by doing I/O.
+///
+/// It is separate from execution so a caller can build one read plan across
+/// many shards and schedule it as a whole. Fused into the decode call, the
+/// only way to overlap shards is a thread per shard parked on its own
+/// completions -- threads that exist to work around the call shape rather
+/// than because anything is unknown.
+fn plan_fixed_subchunk_tasks(
     shard_shape: &[NonZeroU64],
     subchunk_shape: &[NonZeroU64],
-    inner_codecs: &Arc<CodecChain>,
-    shard_index: Option<&[u64]>,
+    shard_index: &[u64],
     subsets: &[ArraySubset],
-    options: &CodecOptions,
-    data_type_size: usize,
-) -> Result<ArrayBytes<'static>, CodecError> {
-    let total_elements = subsets.iter().map(ArraySubset::num_elements).sum();
-    let Some(shard_index) = shard_index else {
-        return Ok(ArrayBytes::new_fill_value(
-            data_type,
-            total_elements,
-            fill_value,
-        )?);
-    };
-
+) -> Result<Vec<FixedSubchunkTask>, CodecError> {
     let chunks_per_shard =
         calculate_chunks_per_shard(shard_shape, subchunk_shape)?.to_array_shape();
     let shard_chunk_grid = RegularChunkGrid::new(
@@ -500,6 +497,32 @@ fn partial_decode_fixed_array_subsets(
         }
     }
 
+    Ok(tasks)
+}
+
+fn partial_decode_fixed_array_subsets(
+    input_handle: &Arc<dyn BytesPartialDecoderTraits>,
+    data_type: &DataType,
+    fill_value: &FillValue,
+    shard_shape: &[NonZeroU64],
+    subchunk_shape: &[NonZeroU64],
+    inner_codecs: &Arc<CodecChain>,
+    shard_index: Option<&[u64]>,
+    subsets: &[ArraySubset],
+    options: &CodecOptions,
+    data_type_size: usize,
+) -> Result<ArrayBytes<'static>, CodecError> {
+    let total_elements = subsets.iter().map(ArraySubset::num_elements).sum();
+    let Some(shard_index) = shard_index else {
+        return Ok(ArrayBytes::new_fill_value(
+            data_type,
+            total_elements,
+            fill_value,
+        )?);
+    };
+
+    let tasks = plan_fixed_subchunk_tasks(shard_shape, subchunk_shape, shard_index, subsets)?;
+
     // Each inner chunk fetches its own encoded bytes inside its own task, so
     // reads are issued concurrently up to the codec concurrent limit.
     //
@@ -539,6 +562,8 @@ fn partial_decode_fixed_array_subsets(
         })
         .collect::<Vec<_>>();
     debug_assert_eq!(output_offset, output_len);
+    let chunks_per_shard =
+        calculate_chunks_per_shard(shard_shape, subchunk_shape)?.to_array_shape();
     let (subchunk_concurrent_limit, inner_options) =
         super::get_concurrent_target_and_codec_options(
             inner_codecs,
