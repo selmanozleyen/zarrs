@@ -1,5 +1,5 @@
 use std::num::NonZeroU64;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use std::collections::HashMap;
 
@@ -339,18 +339,11 @@ struct FixedSubchunkTask {
 /// sees all of its sparse ranges in one call and can turn them into a single
 /// multi-range storage request.
 #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
-/// Admission control for the CPU half of a fetch-then-decode task.
+/// Admission control for the CPU half of a fetch-then-decode pipeline.
 ///
-/// Fetch and decode want opposite concurrency. A thread parked in `pread`
-/// costs no CPU, so every inner chunk should have its read outstanding at
-/// once. Decompression is CPU-bound, so admitting every completed read at
-/// once would oversubscribe the machine and turn the win into scheduler
-/// churn.
-///
-/// So reads fan out unbounded and a completed read waits here until a CPU
-/// slot frees: a task only proceeds when its bytes have arrived AND there is
-/// capacity to decode them. Waiting costs no CPU either, since the thread
-/// blocks on the condvar.
+/// A completed read waits here until a CPU slot frees, so a chunk is only
+/// decompressed when its bytes have arrived AND there is capacity to decode
+/// them. Waiting costs no CPU: the thread parks on the condvar.
 struct DecodeGate {
     slots: Mutex<usize>,
     free: Condvar,
@@ -384,6 +377,59 @@ impl Drop for DecodePermit<'_> {
         self.gate.free.notify_one();
     }
 }
+
+/// Pre-spawned threads that do nothing but block in the storage read.
+///
+/// Deliberately NOT rayon. Rayon is a CPU work-stealing scheduler: blocking
+/// in it is against its contract, and `ThreadPool::install` from another
+/// pool's worker does not park the caller but runs unrelated jobs on it,
+/// which nests arbitrarily deep and makes every configured concurrency
+/// target meaningless. Reads want the opposite of work stealing -- a thread
+/// that parks in `pread` and costs nothing until its bytes arrive.
+///
+/// Threads are spawned once, on first use, so a batch never pays thread
+/// creation. Size via `ZARRS_IO_THREADS`; the default is generous because
+/// these threads are almost always parked, so the bound is really about
+/// bytes in flight and the storage service rate, not about cores.
+struct IoPool {
+    tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl IoPool {
+    fn new(threads: usize) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send + 'static>>();
+        for i in 0..threads {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("zarrs-io-{i}"))
+                // These threads only wait on I/O and move bytes; they do not
+                // recurse through codecs, so they do not need a large stack.
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .expect("failed to spawn zarrs io thread");
+        }
+        Self { tx }
+    }
+
+    fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        // The receivers live for the process, so this cannot fail.
+        let _ = self.tx.send(Box::new(job));
+    }
+}
+
+static IO_POOL: LazyLock<IoPool> = LazyLock::new(|| {
+    let threads = std::env::var("ZARRS_IO_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(64, |n| (n.get() * 8).clamp(64, 1024))
+        });
+    IoPool::new(threads)
+});
 
 fn partial_decode_fixed_array_subsets(
     input_handle: &Arc<dyn BytesPartialDecoderTraits>,
@@ -505,14 +551,7 @@ fn partial_decode_fixed_array_subsets(
     // fan out over every task.
     let decode_gate = DecodeGate::new(subchunk_concurrent_limit);
 
-    let decode_task = |task: FixedSubchunkTask| {
-        let encoded = match task.encoded_range {
-            Some(byte_range) => input_handle
-                .partial_decode_many(Box::new(std::iter::once(byte_range)), options)?
-                .and_then(|subchunks| subchunks.into_iter().next())
-                .map(|bytes| ArrayBytesRaw::from(bytes.into_owned())),
-            None => None,
-        };
+    let decode_task = |task: FixedSubchunkTask, encoded: Option<ArrayBytesRaw<'static>>| {
         let Some(encoded) = encoded else {
             for piece in task.pieces {
                 let mut output_view = unsafe {
@@ -569,10 +608,51 @@ fn partial_decode_fixed_array_subsets(
         Ok(())
     };
 
-    // Fetch fan-out is the task count, not the codec limit: reads should all
-    // be outstanding, and `decode_gate` is what keeps the CPU bounded.
-    let fetch_concurrent_limit = tasks.len().max(1);
-    crate::iter_concurrent_limit!(fetch_concurrent_limit, tasks, try_for_each, decode_task)?;
+    // Submit every read at once to the pre-spawned I/O threads, then decode
+    // completions as they arrive. Reads are never throttled; `decode_gate`
+    // is the only thing bounding CPU.
+    let (tx_done, rx_done) = crossbeam_channel::unbounded();
+    let submitted = tasks.len();
+    for (index, task) in tasks.into_iter().enumerate() {
+        match task.encoded_range {
+            Some(byte_range) => {
+                let input_handle = input_handle.clone();
+                let options = options.clone();
+                let tx_done = tx_done.clone();
+                IO_POOL.submit(move || {
+                    let fetched = input_handle
+                        .partial_decode_many(Box::new(std::iter::once(byte_range)), &options)
+                        .map(|subchunks| {
+                            subchunks
+                                .and_then(|subchunks| subchunks.into_iter().next())
+                                .map(|bytes| ArrayBytesRaw::from(bytes.into_owned()))
+                        });
+                    let _ = tx_done.send((index, task, fetched));
+                });
+            }
+            // Nothing to read: hand it straight to the decode side, which
+            // fills the output with the fill value.
+            None => {
+                let _ = tx_done.send((index, task, Ok(None)));
+            }
+        }
+    }
+    drop(tx_done);
+
+    let mut completions = Vec::with_capacity(submitted);
+    for completion in rx_done {
+        completions.push(completion);
+    }
+    debug_assert_eq!(completions.len(), submitted);
+
+    crate::iter_concurrent_limit!(
+        submitted.max(1),
+        completions,
+        try_for_each,
+        |(_index, task, fetched): (usize, FixedSubchunkTask, Result<Option<ArrayBytesRaw<'static>>, CodecError>)| {
+            decode_task(task, fetched?)
+        }
+    )?;
     unsafe {
         // SAFETY: every byte is written by exactly one disjoint decoded or
         // fill-value piece before successful completion above.
