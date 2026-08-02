@@ -1,4 +1,5 @@
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use std::collections::HashMap;
@@ -639,20 +640,41 @@ fn partial_decode_fixed_array_subsets(
     }
     drop(tx_done);
 
-    let mut completions = Vec::with_capacity(submitted);
-    for completion in rx_done {
-        completions.push(completion);
-    }
-    debug_assert_eq!(completions.len(), submitted);
-
-    crate::iter_concurrent_limit!(
-        submitted.max(1),
-        completions,
-        try_for_each,
-        |(_index, task, fetched): (usize, FixedSubchunkTask, Result<Option<ArrayBytesRaw<'static>>, CodecError>)| {
-            decode_task(task, fetched?)
+    // Decode each chunk the moment it lands. Collecting every completion
+    // first would be a barrier: a shard could not start decompressing until
+    // its slowest read returned, which on a high-latency store is most of the
+    // time the shard spends. `decode_gate` still bounds how many decode
+    // concurrently, so streaming does not oversubscribe the CPU.
+    let failure: Mutex<Option<CodecError>> = Mutex::new(None);
+    let decoded = AtomicUsize::new(0);
+    rayon::scope(|scope| {
+        for (_index, task, fetched) in rx_done {
+            if failure.lock().unwrap().is_some() {
+                break;
+            }
+            let decode_task = &decode_task;
+            let failure = &failure;
+            let decoded = &decoded;
+            scope.spawn(move |_| {
+                let outcome = fetched.and_then(|encoded| decode_task(task, encoded));
+                match outcome {
+                    Ok(()) => {
+                        decoded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        let mut failure = failure.lock().unwrap();
+                        if failure.is_none() {
+                            *failure = Some(error);
+                        }
+                    }
+                }
+            });
         }
-    )?;
+    });
+    if let Some(error) = failure.into_inner().unwrap() {
+        return Err(error);
+    }
+    debug_assert_eq!(decoded.load(Ordering::Relaxed), submitted);
     unsafe {
         // SAFETY: every byte is written by exactly one disjoint decoded or
         // fill-value piece before successful completion above.
