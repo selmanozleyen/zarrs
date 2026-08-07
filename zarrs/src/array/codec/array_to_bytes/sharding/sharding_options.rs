@@ -24,12 +24,14 @@ pub enum SubchunkWriteOrder {
 #[non_exhaustive]
 pub struct ShardingCodecOptions {
     subchunk_write_order: SubchunkWriteOrder,
+    prefetch_subchunk_indexes: bool,
 }
 
 impl Default for ShardingCodecOptions {
     fn default() -> Self {
         Self {
             subchunk_write_order: SubchunkWriteOrder::Unordered,
+            prefetch_subchunk_indexes: false,
         }
     }
 }
@@ -55,6 +57,39 @@ impl ShardingCodecOptions {
     #[must_use]
     pub fn subchunk_write_order(&self) -> SubchunkWriteOrder {
         self.subchunk_write_order
+    }
+
+    /// Read every subchunk index when a partial decoder is created.
+    ///
+    /// Only has an effect where inner chunks are themselves shards. Such an
+    /// inner chunk carries its own index, and a partial decoder keeps each one
+    /// it has read, so the cost is paid once per inner shard either way. This
+    /// moves it to construction, in one pass, instead of letting it land on
+    /// whichever read touches each inner shard first.
+    ///
+    /// Worth setting when a decoder is reused across reads that between them
+    /// touch most inner shards — repeated scattered reads of one shard, say —
+    /// because afterwards every read is planned without going to storage.
+    /// Wasteful when a decoder is built to read one small region once, since
+    /// it reads indexes for inner shards that are never touched.
+    #[must_use]
+    pub fn with_prefetch_subchunk_indexes(mut self, prefetch_subchunk_indexes: bool) -> Self {
+        self.prefetch_subchunk_indexes = prefetch_subchunk_indexes;
+        self
+    }
+
+    /// Set whether subchunk indexes are read up front.
+    pub fn set_prefetch_subchunk_indexes(&mut self, prefetch_subchunk_indexes: bool) -> &mut Self {
+        self.prefetch_subchunk_indexes = prefetch_subchunk_indexes;
+        self
+    }
+
+    /// Whether subchunk indexes are read up front.
+    ///
+    /// See [`with_prefetch_subchunk_indexes`](Self::with_prefetch_subchunk_indexes).
+    #[must_use]
+    pub fn prefetch_subchunk_indexes(&self) -> bool {
+        self.prefetch_subchunk_indexes
     }
 }
 

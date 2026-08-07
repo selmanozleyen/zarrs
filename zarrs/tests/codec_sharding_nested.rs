@@ -13,7 +13,9 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
-use zarrs::array::{Array, ArrayBuilder, UnboundArrayToBytesCodecTraits, data_type};
+use zarrs::array::{
+    Array, ArrayBuilder, ArraySubset, CodecOptions, UnboundArrayToBytesCodecTraits, data_type,
+};
 use zarrs::storage::storage_adapter::performance_metrics::PerformanceMetricsStorageAdapter;
 use zarrs::storage::store::MemoryStore;
 
@@ -136,6 +138,37 @@ fn nested_sharding_reads_one_index_per_level() -> Result<(), Box<dyn Error>> {
     assert!(
         nested_bytes < flat_bytes,
         "nested indexes are smaller: {nested_bytes} vs {flat_bytes}"
+    );
+
+    Ok(())
+}
+
+/// A partial decoder reads each inner shard's index once, not once per access.
+///
+/// The extra read nesting costs is per inner shard, not per read: a decoder
+/// keeps the inner decoders it has built, and each of those holds its decoded
+/// index. Two reads landing in the same inner shard should therefore differ by
+/// exactly that index read.
+#[test]
+fn nested_sharding_reads_each_inner_index_once() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let decoder = array.partial_decoder(&[0, 0])?;
+
+    // Both subsets live in inner shard [0, 0], in different innermost chunks.
+    let before = store.reads();
+    decoder.partial_decode(&ArraySubset::new_with_ranges(&[0..2, 0..2]), &options)?;
+    let first = store.reads() - before;
+
+    let before = store.reads();
+    decoder.partial_decode(&ArraySubset::new_with_ranges(&[2..4, 2..4]), &options)?;
+    let second = store.reads() - before;
+
+    println!("first: {first} reads, second: {second} reads");
+    assert_eq!(
+        second,
+        first - 1,
+        "the second read into the same inner shard should skip its index"
     );
 
     Ok(())

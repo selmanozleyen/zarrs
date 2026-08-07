@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -34,8 +35,17 @@ pub struct ShardingPartialDecoder {
     subchunk_shape: ChunkShape,
     inner_codecs: Arc<CodecChainBound>,
     shard_index: Option<Vec<u64>>,
-    #[expect(dead_code)] // TODO: Remove when sharding-specific options are added
     sharding_options: ShardingCodecOptions,
+    /// Inner-chunk decoders kept across accesses, keyed by shard index entry.
+    ///
+    /// Building one of these decodes that chunk's own index when the inner
+    /// chunk is itself a shard — a read plus a decode. Without keeping them,
+    /// that repeats every time the same inner shard is touched, so a scattered
+    /// read over one shard pays it per access rather than per inner shard.
+    ///
+    /// [`None`] when inner chunks are not themselves shards: construction is
+    /// then cheap and a shared map would only add contention.
+    subchunk_decoders: Option<Mutex<HashMap<u64, Arc<dyn ArrayPartialDecoderTraits>>>>,
 }
 
 impl ShardingPartialDecoder {
@@ -60,14 +70,66 @@ impl ShardingPartialDecoder {
             options,
         )?;
 
-        Ok(Self {
+        let mut decoder = Self {
             input_handle,
             shard_shape,
             subchunk_shape,
             inner_codecs,
             shard_index,
             sharding_options,
-        })
+            subchunk_decoders: None,
+        };
+
+        // Only worth keeping decoders when building one is expensive, which is
+        // when the inner chunk is itself a shard carrying its own index. More
+        // than one level in the local grid hierarchy is exactly that.
+        if decoder.local_subchunk_grids(options)?.len() > 1 {
+            decoder.subchunk_decoders = Some(Mutex::new(HashMap::new()));
+            if decoder.sharding_options.prefetch_subchunk_indexes() {
+                decoder.prefetch_subchunk_decoders(options)?;
+            }
+        }
+        Ok(decoder)
+    }
+
+    /// Build and keep every present inner chunk's decoder, reading each inner
+    /// index once, so later reads resolve without going to storage.
+    fn prefetch_subchunk_decoders(&self, options: &CodecOptions) -> Result<(), CodecError> {
+        let Some(shard_index) = self.shard_index.as_deref() else {
+            return Ok(());
+        };
+        for entry in 0..(shard_index.len() / 2) as u64 {
+            let offset = shard_index[entry as usize * 2];
+            let size = shard_index[entry as usize * 2 + 1];
+            if offset == u64::MAX && size == u64::MAX {
+                continue;
+            }
+            self.subchunk_decoder(entry, offset, size, options)?;
+        }
+        Ok(())
+    }
+
+    /// The decoder for one inner chunk, reusing a previously built one.
+    ///
+    /// `entry` is the chunk's index into the shard index, which is already
+    /// computed wherever an inner chunk is located.
+    fn subchunk_decoder(
+        &self,
+        entry: u64,
+        offset: ByteOffset,
+        size: ByteLength,
+        options: &CodecOptions,
+    ) -> Result<Arc<dyn ArrayPartialDecoderTraits>, CodecError> {
+        cached_subchunk_partial_decoder(
+            self.subchunk_decoders.as_ref(),
+            entry,
+            &self.input_handle,
+            &self.subchunk_shape,
+            &self.inner_codecs,
+            options,
+            offset,
+            size,
+        )
     }
 
     /// Retrieve the byte range of an encoded subchunk.
@@ -102,11 +164,13 @@ impl ShardingPartialDecoder {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn partial_decode(
     input_handle: &Arc<dyn BytesPartialDecoderTraits>,
     shard_shape: &[NonZeroU64],
     subchunk_shape: &[NonZeroU64],
     inner_codecs: &Arc<CodecChainBound>,
+    subchunk_decoders: Option<&SubchunkDecoderCache>,
     shard_index: Option<&[u64]>,
     indexer: &dyn crate::array::Indexer,
     options: &CodecOptions,
@@ -147,6 +211,7 @@ pub(crate) fn partial_decode(
                     shard_shape,
                     subchunk_shape,
                     inner_codecs,
+                    subchunk_decoders,
                     shard_index,
                     subset,
                     options,
@@ -215,6 +280,7 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
             &self.shard_shape,
             &self.subchunk_shape,
             &self.inner_codecs,
+            self.subchunk_decoders.as_ref(),
             self.shard_index.as_deref(),
             indexer,
             options,
@@ -255,6 +321,7 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
                 &self.shard_shape,
                 &self.subchunk_shape,
                 &self.inner_codecs,
+                self.subchunk_decoders.as_ref(),
                 self.shard_index.as_deref(),
                 subset,
                 options,
@@ -495,6 +562,54 @@ fn partial_decode_fixed_array_subset_prefetched_into(
     Ok(())
 }
 
+/// Inner-chunk decoders kept across accesses, keyed by shard index entry.
+type SubchunkDecoderCache = Mutex<HashMap<u64, Arc<dyn ArrayPartialDecoderTraits>>>;
+
+/// [`get_subchunk_partial_decoder`], reusing an already-built decoder for the
+/// same inner chunk when the caller is keeping them.
+#[expect(clippy::too_many_arguments)]
+fn cached_subchunk_partial_decoder(
+    cache: Option<&SubchunkDecoderCache>,
+    entry: u64,
+    input_handle: &Arc<dyn BytesPartialDecoderTraits>,
+    subchunk_shape: &[NonZeroU64],
+    inner_codecs: &Arc<CodecChainBound>,
+    options: &CodecOptions,
+    byte_offset: ByteOffset,
+    byte_length: ByteLength,
+) -> Result<Arc<dyn ArrayPartialDecoderTraits>, CodecError> {
+    let Some(cache) = cache else {
+        return get_subchunk_partial_decoder(
+            input_handle,
+            subchunk_shape,
+            inner_codecs,
+            options,
+            byte_offset,
+            byte_length,
+        );
+    };
+    if let Some(decoder) = cache.lock().unwrap().get(&entry) {
+        return Ok(decoder.clone());
+    }
+    // Built outside the lock: this reads and decodes the inner index, and
+    // holding the lock across it would serialise every inner shard behind
+    // whichever one happens to be read first.
+    let decoder = get_subchunk_partial_decoder(
+        input_handle,
+        subchunk_shape,
+        inner_codecs,
+        options,
+        byte_offset,
+        byte_length,
+    )?;
+    Ok(cache
+        .lock()
+        .unwrap()
+        .entry(entry)
+        .or_insert(decoder)
+        .clone())
+}
+
 fn get_subchunk_partial_decoder(
     input_handle: &Arc<dyn BytesPartialDecoderTraits>,
     subchunk_shape: &[NonZeroU64],
@@ -532,6 +647,7 @@ fn partial_decode_fixed_array_subset_into(
     shard_shape: &[NonZeroU64],
     subchunk_shape: &[NonZeroU64],
     inner_codecs: &Arc<CodecChainBound>,
+    subchunk_decoders: Option<&SubchunkDecoderCache>,
     shard_index: Option<&[u64]>,
     array_subset: &dyn ArraySubsetTraits,
     options: &CodecOptions,
@@ -590,7 +706,9 @@ fn partial_decode_fixed_array_subset_into(
                 .map_err(CodecError::from)
         } else {
             // Partially decode the subchunk
-            let inner_partial_decoder = get_subchunk_partial_decoder(
+            let inner_partial_decoder = cached_subchunk_partial_decoder(
+                subchunk_decoders,
+                shard_index_idx as u64,
                 input_handle,
                 subchunk_shape,
                 inner_codecs,
