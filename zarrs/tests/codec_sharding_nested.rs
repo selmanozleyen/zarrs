@@ -12,7 +12,7 @@ use std::error::Error;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
+use zarrs::array::codec::array_to_bytes::sharding::{ShardingCodecBuilder, ShardingCodecOptions};
 use zarrs::array::{
     Array, ArrayBuilder, ArraySubset, CodecOptions, UnboundArrayToBytesCodecTraits, data_type,
 };
@@ -35,6 +35,10 @@ const fn nz(v: u64) -> NonZeroU64 {
 /// - nested: one index over 4 `[4, 4]` inner shards, each with its own index
 ///   over 4 `[2, 2]` chunks
 fn build(nested: bool) -> TestArray {
+    build_opt(nested, ShardingCodecOptions::default())
+}
+
+fn build_opt(nested: bool, options: ShardingCodecOptions) -> TestArray {
     let store = Arc::new(PerformanceMetricsStorageAdapter::new(Arc::new(
         MemoryStore::default(),
     )));
@@ -44,10 +48,15 @@ fn build(nested: bool) -> TestArray {
         Arc::new(
             ShardingCodecBuilder::new(vec![nz(4), nz(4)], &data_type)
                 .array_to_bytes_codec(Arc::new(inner))
-                .build(),
+                .build()
+                .with_options(options),
         )
     } else {
-        Arc::new(ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type).build())
+        Arc::new(
+            ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type)
+                .build()
+                .with_options(options),
+        )
     };
     let mut builder = ArrayBuilder::new(vec![16, 16], vec![8, 8], data_type, 0u16);
     builder.array_to_bytes_codec(codec);
@@ -169,6 +178,66 @@ fn nested_sharding_reads_each_inner_index_once() -> Result<(), Box<dyn Error>> {
         second,
         first - 1,
         "the second read into the same inner shard should skip its index"
+    );
+
+    Ok(())
+}
+
+/// Reading the subchunk indexes up front moves their cost, it does not remove
+/// it.
+///
+/// Eager pays for every inner shard at construction; lazy pays per inner shard
+/// on first touch. A reader that eventually touches them all does the same
+/// total work either way, so the case for eager is that afterwards every read
+/// resolves without going to storage -- and the case against is the inner
+/// shards it reads that are never used.
+#[test]
+fn eager_prefetch_moves_index_reads_to_construction() -> Result<(), Box<dyn Error>> {
+    let mut measured = Vec::new();
+    for eager in [false, true] {
+        let (array, store) = build_opt(
+            true,
+            ShardingCodecOptions::default().with_prefetch_subchunk_indexes(eager),
+        )?;
+        let options = CodecOptions::default();
+
+        let before = store.reads();
+        let decoder = array.partial_decoder_opt(&[0, 0], &options)?;
+        let build_reads = store.reads() - before;
+
+        // Touch all four inner shards of this shard, one small region each.
+        let before = store.reads();
+        for (row, col) in [(0, 0), (0, 4), (4, 0), (4, 4)] {
+            decoder.partial_decode(
+                &ArraySubset::new_with_ranges(&[row..row + 2, col..col + 2]),
+                &options,
+            )?;
+        }
+        let read_reads = store.reads() - before;
+
+        println!(
+            "eager={eager}: {build_reads} reads to build, {read_reads} reads to decode, \
+             {} total",
+            build_reads + read_reads
+        );
+        measured.push((build_reads, read_reads));
+    }
+
+    let (lazy_build, lazy_read) = measured[0];
+    let (eager_build, eager_read) = measured[1];
+
+    assert!(
+        eager_build > lazy_build,
+        "eager should read the inner indexes at construction: {eager_build} vs {lazy_build}"
+    );
+    assert!(
+        eager_read < lazy_read,
+        "and so decode should not read them again: {eager_read} vs {lazy_read}"
+    );
+    assert_eq!(
+        eager_build + eager_read,
+        lazy_build + lazy_read,
+        "touching every inner shard costs the same either way; eager only moves it"
     );
 
     Ok(())
