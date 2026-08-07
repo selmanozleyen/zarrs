@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased](https://github.com/zarrs/zarrs/compare/zarrs-v0.23.13...HEAD)
 
 ### Added
-- Add `ArrayPartialDecoderTraits::{read_plan,partial_decode_prefetched}` so a caller can collect the reads of several decoders, issue them together, and hand the bytes back
+- Add `ArrayPartialDecoderTraits::{read_plan,partial_decode_from_bytes}` so a caller can collect the reads of several decoders, issue them together, and hand the bytes back
   - Implemented by the `sharding_indexed` partial decoder for fixed-size array subsets; other decoders report no plan and are unaffected
 - Add the `cast_value` array-to-array codec
 - Implement `Default` for `MetadataRetrieveVersion`

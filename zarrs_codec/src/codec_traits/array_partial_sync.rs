@@ -99,7 +99,7 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
     /// performing them.
     ///
     /// Returns one entry per unit of encoded input, in the order
-    /// [`partial_decode_prefetched`](Self::partial_decode_prefetched) expects them back.
+    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes) expects them back.
     /// A [`None`] entry marks a unit with nothing to read, which decodes to the fill value.
     ///
     /// This lets a caller holding several decoders issue all of their reads together and
@@ -127,20 +127,28 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
     /// `fetched` must correspond one-to-one, and in order, with the plan returned by
     /// [`read_plan`](Self::read_plan) for the same `indexer`. The call performs no I/O.
     ///
-    /// The default implementation ignores `fetched` and defers to
-    /// [`partial_decode`](Self::partial_decode), which is always correct but does its own
-    /// reads. Only decoders that return a plan need override it.
+    /// A decoder reporting no plan cannot interpret supplied bytes: nothing defines what
+    /// their positions mean. The default therefore accepts only an empty `fetched` and
+    /// defers to [`partial_decode`](Self::partial_decode). Passing bytes to a decoder that
+    /// never planned is a caller error -- they were fetched against something else -- and
+    /// discarding them silently would turn that mistake into unexplained reads instead of
+    /// a failure.
     ///
     /// # Errors
     /// Returns [`CodecError`] if a codec fails, an array subset is invalid, or `fetched`
     /// does not match the plan.
-    fn partial_decode_prefetched(
+    fn partial_decode_from_bytes(
         &self,
         indexer: &dyn Indexer,
         fetched: Vec<Option<ArrayBytesRaw<'static>>>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError> {
-        let _ = fetched;
+        if !fetched.is_empty() {
+            return Err(CodecError::Other(format!(
+                "{} byte range(s) supplied, but this decoder reports no read plan",
+                fetched.len()
+            )));
+        }
         self.partial_decode(indexer, options)
     }
 

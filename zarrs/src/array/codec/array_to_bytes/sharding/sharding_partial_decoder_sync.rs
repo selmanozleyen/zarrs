@@ -308,15 +308,23 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
         .map(Some)
     }
 
-    fn partial_decode_prefetched(
+    fn partial_decode_from_bytes(
         &self,
         indexer: &dyn Indexer,
         fetched: Vec<Option<ArrayBytesRaw<'static>>>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError> {
         let Some(subset) = self.planned_subset(indexer, options)? else {
-            // No plan was offered for this indexer, so `fetched` cannot belong
-            // to one. Decode normally.
+            // No plan for this indexer -- nested sharding, or a variable-size
+            // type. Reject supplied bytes rather than discard them: they were
+            // fetched against something else, and quietly re-reading would
+            // hide the mistake behind unexplained I/O.
+            if !fetched.is_empty() {
+                return Err(CodecError::Other(format!(
+                    "{} byte range(s) supplied, but this indexer has no read plan",
+                    fetched.len()
+                )));
+            }
             return self.partial_decode(indexer, options);
         };
         let data_type_size = match self.inner_codecs.data_type().size() {
@@ -335,7 +343,7 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
                 ArraySubset::new_with_shape(array_shape.to_vec()),
             )?
         };
-        partial_decode_fixed_array_subset_prefetched_into(
+        partial_decode_fixed_array_subset_from_bytes_into(
             &self.shard_shape,
             &self.subchunk_shape,
             &self.inner_codecs,
@@ -404,7 +412,7 @@ fn plan_fixed_array_subset(
         .chunks_in_array_subset(array_subset)?
         .expect("subchunks always within shard");
     // A missing shard reads nothing at all, but still reports one entry per
-    // inner chunk so the plan stays one-to-one with the prefetched bytes.
+    // inner chunk so the plan stays one-to-one with the supplied bytes.
     Ok(chunks
         .indices()
         .into_iter()
@@ -431,10 +439,10 @@ fn subchunk_encoded_range(
     (offset != u64::MAX || size != u64::MAX).then_some(ByteRange::FromStart(offset, Some(size)))
 }
 
-/// The prefetched twin of [`partial_decode_fixed_array_subset_into`]: identical
+/// The supplied-bytes twin of [`partial_decode_fixed_array_subset_into`]: identical
 /// geometry, but each inner chunk decodes from bytes the caller supplied rather
 /// than from a byte interval of the input handle.
-fn partial_decode_fixed_array_subset_prefetched_into(
+fn partial_decode_fixed_array_subset_from_bytes_into(
     shard_shape: &[NonZeroU64],
     subchunk_shape: &[NonZeroU64],
     inner_codecs: &Arc<CodecChainBound>,

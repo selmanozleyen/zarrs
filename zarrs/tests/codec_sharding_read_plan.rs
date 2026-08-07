@@ -1,9 +1,9 @@
-//! `ArrayPartialDecoderTraits::read_plan` / `partial_decode_prefetched`.
+//! `ArrayPartialDecoderTraits::read_plan` / `partial_decode_from_bytes`.
 //!
 //! The point of the pair is that a caller holding several decoders can collect
 //! all of their reads, issue them together, and hand the bytes back. These
 //! tests pin the two properties that makes possible: planning touches no
-//! storage, and decoding from prefetched bytes touches no storage either.
+//! storage, and decoding from supplied bytes touches no storage either.
 
 #![allow(missing_docs)]
 
@@ -54,7 +54,7 @@ fn build(nested: bool) -> TestArray {
 }
 
 #[test]
-fn plan_then_prefetched_decode_matches_and_reads_nothing() -> Result<(), Box<dyn Error>> {
+fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (array, store) = build(false)?;
     let key: StoreKey = array.chunk_key(&[0, 0]);
@@ -84,12 +84,12 @@ fn plan_then_prefetched_decode_matches_and_reads_nothing() -> Result<(), Box<dyn
 
     let before = store.reads();
     let decoded = decoder
-        .partial_decode_prefetched(&subset, fetched, &options)?
+        .partial_decode_from_bytes(&subset, fetched, &options)?
         .into_fixed()?;
     assert_eq!(
         store.reads(),
         before,
-        "prefetched decode must not touch storage"
+        "decoding from supplied bytes must not touch storage"
     );
     assert_eq!(decoded, expected);
 
@@ -97,7 +97,7 @@ fn plan_then_prefetched_decode_matches_and_reads_nothing() -> Result<(), Box<dyn
 }
 
 /// A shard with no inner chunk present still reports one entry per chunk, so
-/// the plan stays one-to-one with what `partial_decode_prefetched` expects.
+/// the plan stays one-to-one with what `partial_decode_from_bytes` expects.
 #[test]
 fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
@@ -114,7 +114,7 @@ fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     assert!(plan.iter().all(Option::is_none), "nothing to read");
 
     let decoded = decoder
-        .partial_decode_prefetched(&subset, vec![None; plan.len()], &options)?
+        .partial_decode_from_bytes(&subset, vec![None; plan.len()], &options)?
         .into_fixed()?;
     assert_eq!(decoded, vec![0u8; 4 * 4 * 2], "fill value");
 
@@ -139,13 +139,23 @@ fn nested_sharding_reports_no_plan() -> Result<(), Box<dyn Error>> {
         "nested sharding must not report a one-level plan"
     );
 
-    // And the fallback stays correct: with no plan, prefetched decode defers
-    // to `partial_decode` and ignores whatever it was handed.
+    // With no plan and nothing supplied, it defers to `partial_decode`.
     let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
     let decoded = decoder
-        .partial_decode_prefetched(&subset, Vec::new(), &options)?
+        .partial_decode_from_bytes(&subset, Vec::new(), &options)?
         .into_fixed()?;
     assert_eq!(decoded, expected);
+
+    // Bytes handed to a decoder that reported no plan were fetched against
+    // something else. Discarding them and reading again would hide the
+    // caller's mistake as unexplained I/O, so it fails instead.
+    let err = decoder
+        .partial_decode_from_bytes(&subset, vec![None; 3], &options)
+        .expect_err("supplying bytes without a plan must fail");
+    assert!(
+        err.to_string().contains("no read plan"),
+        "unexpected error: {err}"
+    );
 
     Ok(())
 }
