@@ -4,10 +4,11 @@ use zarrs_chunk_grid::{ChunkGrid, Indexer};
 use zarrs_data_type::DataType;
 use zarrs_plugin::{MaybeSend, MaybeSync};
 use zarrs_storage::StorageError;
+use zarrs_storage::byte_range::ByteRange;
 
 use crate::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, CodecError, CodecOptions, InvalidNumberOfElementsError,
-    decode_into_array_bytes_target,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesRaw, CodecError, CodecOptions,
+    InvalidNumberOfElementsError, decode_into_array_bytes_target,
 };
 
 /// Partial array decoder traits.
@@ -92,6 +93,55 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
 
         let decoded_value = self.partial_decode(indexer, options)?;
         decode_into_array_bytes_target(&decoded_value, output_target)
+    }
+
+    /// Report the reads [`partial_decode`](Self::partial_decode) would perform, without
+    /// performing them.
+    ///
+    /// Returns one entry per unit of encoded input, in the order
+    /// [`partial_decode_prefetched`](Self::partial_decode_prefetched) expects them back.
+    /// A [`None`] entry marks a unit with nothing to read, which decodes to the fill value.
+    ///
+    /// This lets a caller holding several decoders issue all of their reads together and
+    /// schedule them as a whole, rather than one decoder at a time. It is worthwhile when
+    /// a read costs far more than the decode it feeds, which is the usual case for a
+    /// sharded array on network or parallel storage.
+    ///
+    /// Planning performs no reads: it is computed from state the decoder already holds.
+    /// Returns [`None`] if the decoder cannot describe its reads ahead of time, in which
+    /// case use [`partial_decode`](Self::partial_decode).
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if the indexer is invalid for this decoder.
+    fn read_plan(
+        &self,
+        indexer: &dyn Indexer,
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<Option<ByteRange>>>, CodecError> {
+        let _ = (indexer, options);
+        Ok(None)
+    }
+
+    /// Partially decode a chunk from encoded bytes the caller already fetched.
+    ///
+    /// `fetched` must correspond one-to-one, and in order, with the plan returned by
+    /// [`read_plan`](Self::read_plan) for the same `indexer`. The call performs no I/O.
+    ///
+    /// The default implementation ignores `fetched` and defers to
+    /// [`partial_decode`](Self::partial_decode), which is always correct but does its own
+    /// reads. Only decoders that return a plan need override it.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if a codec fails, an array subset is invalid, or `fetched`
+    /// does not match the plan.
+    fn partial_decode_prefetched(
+        &self,
+        indexer: &dyn Indexer,
+        fetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        let _ = fetched;
+        self.partial_decode(indexer, options)
     }
 
     /// Returns whether this decoder supports partial decoding.

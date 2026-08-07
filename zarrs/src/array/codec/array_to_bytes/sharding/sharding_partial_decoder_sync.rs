@@ -266,9 +266,233 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
         }
     }
 
+    fn read_plan(
+        &self,
+        indexer: &dyn Indexer,
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<Option<ByteRange>>>, CodecError> {
+        let Some(subset) = self.planned_subset(indexer, options)? else {
+            return Ok(None);
+        };
+        plan_fixed_array_subset(
+            &self.shard_shape,
+            &self.subchunk_shape,
+            self.shard_index.as_deref(),
+            subset,
+        )
+        .map(Some)
+    }
+
+    fn partial_decode_prefetched(
+        &self,
+        indexer: &dyn Indexer,
+        fetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError> {
+        let Some(subset) = self.planned_subset(indexer, options)? else {
+            // No plan was offered for this indexer, so `fetched` cannot belong
+            // to one. Decode normally.
+            return self.partial_decode(indexer, options);
+        };
+        let data_type_size = match self.inner_codecs.data_type().size() {
+            DataTypeSize::Fixed(size) => size,
+            DataTypeSize::Variable => unreachable!("planned_subset rejects variable sizes"),
+        };
+
+        let array_shape = subset.shape();
+        let mut out = vec![0; subset.num_elements_usize() * data_type_size];
+        let out_slice = UnsafeCellSlice::new(out.as_mut_slice());
+        let mut output_view = unsafe {
+            ArrayBytesFixedDisjointView::new(
+                out_slice,
+                data_type_size,
+                &array_shape,
+                ArraySubset::new_with_shape(array_shape.to_vec()),
+            )?
+        };
+        partial_decode_fixed_array_subset_prefetched_into(
+            &self.shard_shape,
+            &self.subchunk_shape,
+            &self.inner_codecs,
+            subset,
+            fetched,
+            options,
+            &mut output_view,
+        )?;
+        Ok(ArrayBytes::from(out))
+    }
+
     fn supports_partial_decode(&self) -> bool {
         self.input_handle.supports_partial_decode()
     }
+}
+
+impl ShardingPartialDecoder {
+    /// The array subset a read plan can be built for, or [`None`] if this
+    /// indexer takes a path that does not read one inner chunk per range.
+    fn planned_subset<'a>(
+        &self,
+        indexer: &'a dyn Indexer,
+        options: &CodecOptions,
+    ) -> Result<Option<&'a dyn ArraySubsetTraits>, CodecError> {
+        // Only the fixed-size array subset path decodes one inner chunk per read.
+        let data_type = self.inner_codecs.data_type();
+        if data_type.is_optional() || matches!(data_type.size(), DataTypeSize::Variable) {
+            return Ok(None);
+        }
+        let Some(subset) = indexer.as_array_subset() else {
+            return Ok(None);
+        };
+        if subset.dimensionality() != self.shard_shape.len() {
+            return Ok(None);
+        }
+
+        // A plan describes one level of reads. When an inner chunk is itself
+        // subchunked -- sharding nested inside sharding -- a range per inner
+        // chunk names whole inner shards rather than the bytes actually
+        // wanted. Report nothing rather than something misleading; the caller
+        // falls back to `partial_decode`, which walks the levels itself.
+        if self.local_subchunk_grids(options)?.len() > 1 {
+            return Ok(None);
+        }
+
+        Ok(Some(subset))
+    }
+}
+
+/// The reads a fixed-size array subset decode performs, in subchunk iteration
+/// order. Pure computation: the shard index is already resident.
+fn plan_fixed_array_subset(
+    shard_shape: &[NonZeroU64],
+    subchunk_shape: &[NonZeroU64],
+    shard_index: Option<&[u64]>,
+    array_subset: &dyn ArraySubsetTraits,
+) -> Result<Vec<Option<ByteRange>>, CodecError> {
+    let chunks_per_shard =
+        calculate_chunks_per_shard(shard_shape, subchunk_shape)?.to_array_shape();
+    let shard_chunk_grid = RegularChunkGrid::new(
+        bytemuck::must_cast_slice(shard_shape).to_vec(),
+        subchunk_shape.to_vec(),
+    )
+    .map_err(Into::<IncompatibleDimensionalityError>::into)?;
+    let chunks = shard_chunk_grid
+        .chunks_in_array_subset(array_subset)?
+        .expect("subchunks always within shard");
+    // A missing shard reads nothing at all, but still reports one entry per
+    // inner chunk so the plan stays one-to-one with the prefetched bytes.
+    Ok(chunks
+        .indices()
+        .into_iter()
+        .map(|chunk_indices| {
+            shard_index.and_then(|shard_index| {
+                subchunk_encoded_range(shard_index, &chunks_per_shard, &chunk_indices)
+            })
+        })
+        .collect())
+}
+
+/// The byte range of one encoded inner chunk, or [`None`] if it is absent and
+/// decodes to the fill value.
+fn subchunk_encoded_range(
+    shard_index: &[u64],
+    chunks_per_shard: &[u64],
+    chunk_indices: &[u64],
+) -> Option<ByteRange> {
+    let shard_index_idx =
+        usize::try_from(ravel_indices(chunk_indices, chunks_per_shard).expect("inbounds chunk"))
+            .expect("index fits in usize");
+    let offset = shard_index[shard_index_idx * 2];
+    let size = shard_index[shard_index_idx * 2 + 1];
+    (offset != u64::MAX || size != u64::MAX).then_some(ByteRange::FromStart(offset, Some(size)))
+}
+
+/// The prefetched twin of [`partial_decode_fixed_array_subset_into`]: identical
+/// geometry, but each inner chunk decodes from bytes the caller supplied rather
+/// than from a byte interval of the input handle.
+fn partial_decode_fixed_array_subset_prefetched_into(
+    shard_shape: &[NonZeroU64],
+    subchunk_shape: &[NonZeroU64],
+    inner_codecs: &Arc<CodecChainBound>,
+    array_subset: &dyn ArraySubsetTraits,
+    fetched: Vec<Option<ArrayBytesRaw<'static>>>,
+    options: &CodecOptions,
+    output_view: &mut ArrayBytesFixedDisjointView<'_>,
+) -> Result<(), CodecError> {
+    let fill_value = inner_codecs.fill_value();
+    if array_subset.len() != output_view.num_elements() {
+        return Err(InvalidNumberOfElementsError::new(
+            array_subset.len(),
+            output_view.num_elements(),
+        )
+        .into());
+    }
+    let chunks_per_shard =
+        calculate_chunks_per_shard(shard_shape, subchunk_shape)?.to_array_shape();
+    let (subchunk_concurrent_limit, options) = super::get_concurrent_target_and_codec_options(
+        inner_codecs,
+        subchunk_shape,
+        &chunks_per_shard,
+        options,
+    )?;
+    let shard_chunk_grid = RegularChunkGrid::new(
+        bytemuck::must_cast_slice(shard_shape).to_vec(),
+        subchunk_shape.to_vec(),
+    )
+    .map_err(Into::<IncompatibleDimensionalityError>::into)?;
+
+    let chunks = shard_chunk_grid
+        .chunks_in_array_subset(array_subset)?
+        .expect("subchunks always within shard");
+    let chunk_indices = chunks.indices().into_iter().collect::<Vec<_>>();
+    if fetched.len() != chunk_indices.len() {
+        return Err(CodecError::Other(format!(
+            "fetched bytes ({}) do not match the read plan ({})",
+            fetched.len(),
+            chunk_indices.len()
+        )));
+    }
+
+    let array_subset_start = array_subset.start();
+    let decode_subchunk =
+        |(chunk_indices, encoded): (ArrayIndicesTinyVec, Option<ArrayBytesRaw>)| {
+            let chunk_subset = shard_chunk_grid
+                .subset(&chunk_indices)
+                .expect("matching dimensionality")
+                .expect("subchunk always within shard");
+            let chunk_subset_overlap = array_subset.overlap(&chunk_subset)?;
+            let chunk_relative = chunk_subset_overlap.relative_to(&array_subset_start)?;
+            let chunk_output_overlap_subset =
+                chunk_relative.offset(output_view.subset().start())?;
+            // SAFETY: chunks represent disjoint array subsets
+            let mut subchunk_view: ArrayBytesFixedDisjointView<'_> =
+                unsafe { output_view.subdivide(chunk_output_overlap_subset)? };
+            let Some(encoded) = encoded else {
+                return subchunk_view
+                    .fill(fill_value.as_ne_bytes())
+                    .map_err(CodecError::from);
+            };
+            // The bytes are already here, so the inner decoder reads from memory.
+            let inner_partial_decoder = inner_codecs.clone().partial_decoder(
+                Arc::new(encoded.into_owned()),
+                subchunk_shape,
+                &options,
+            )?;
+            inner_partial_decoder.partial_decode_into(
+                &chunk_subset_overlap
+                    .relative_to(chunk_subset.start())
+                    .unwrap(),
+                ArrayBytesDecodeIntoTarget::Fixed(&mut subchunk_view),
+                &options,
+            )
+        };
+
+    crate::iter_concurrent_limit!(
+        subchunk_concurrent_limit,
+        chunk_indices.into_iter().zip(fetched).collect::<Vec<_>>(),
+        try_for_each,
+        decode_subchunk
+    )?;
+    Ok(())
 }
 
 fn get_subchunk_partial_decoder(
