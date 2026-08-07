@@ -205,13 +205,19 @@ fn eager_prefetch_moves_index_reads_to_construction() -> Result<(), Box<dyn Erro
         let decoder = array.partial_decoder_opt(&[0, 0], &options)?;
         let build_reads = store.reads() - before;
 
-        // Touch all four inner shards of this shard, one small region each.
+        // Visit all four inner shards twice, a different innermost chunk each
+        // pass. Visiting twice is what separates the two effects: eager only
+        // moves the index reads, while keeping the decoders is what stops the
+        // second pass paying for them again.
         let before = store.reads();
-        for (row, col) in [(0, 0), (0, 4), (4, 0), (4, 4)] {
-            decoder.partial_decode(
-                &ArraySubset::new_with_ranges(&[row..row + 2, col..col + 2]),
-                &options,
-            )?;
+        for pass in 0..2u64 {
+            for (row, col) in [(0u64, 0u64), (0, 4), (4, 0), (4, 4)] {
+                let row = row + pass * 2;
+                decoder.partial_decode(
+                    &ArraySubset::new_with_ranges(&[row..row + 2, col..col + 2]),
+                    &options,
+                )?;
+            }
         }
         let read_reads = store.reads() - before;
 
