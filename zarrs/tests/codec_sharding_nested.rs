@@ -180,70 +180,25 @@ fn nested_sharding_reads_each_inner_index_once() -> Result<(), Box<dyn Error>> {
         "the second read into the same inner shard should skip its index"
     );
 
-    Ok(())
-}
-
-/// Reading the subchunk indexes up front moves their cost, it does not remove
-/// it.
-///
-/// Eager pays for every inner shard at construction; lazy pays per inner shard
-/// on first touch. A reader that eventually touches them all does the same
-/// total work either way, so the case for eager is that afterwards every read
-/// resolves without going to storage -- and the case against is the inner
-/// shards it reads that are never used.
-#[test]
-fn eager_prefetch_moves_index_reads_to_construction() -> Result<(), Box<dyn Error>> {
-    let mut measured = Vec::new();
-    for eager in [false, true] {
-        let (array, store) = build_opt(
-            true,
-            ShardingCodecOptions::default().with_prefetch_subchunk_indexes(eager),
-        )?;
-        let options = CodecOptions::default();
-
-        let before = store.reads();
-        let decoder = array.partial_decoder_opt(&[0, 0], &options)?;
-        let build_reads = store.reads() - before;
-
-        // Visit all four inner shards twice, a different innermost chunk each
-        // pass. Visiting twice is what separates the two effects: eager only
-        // moves the index reads, while keeping the decoders is what stops the
-        // second pass paying for them again.
-        let before = store.reads();
-        for pass in 0..2u64 {
-            for (row, col) in [(0u64, 0u64), (0, 4), (4, 0), (4, 4)] {
-                let row = row + pass * 2;
-                decoder.partial_decode(
-                    &ArraySubset::new_with_ranges(&[row..row + 2, col..col + 2]),
-                    &options,
-                )?;
-            }
+    // Across the whole shard: visiting all four inner shards twice costs four
+    // index reads, not eight. Without keeping the decoders this would be eight.
+    let (array, store) = build(true)?;
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let before = store.reads();
+    for pass in 0..2u64 {
+        for (row, col) in [(0u64, 0u64), (0, 4), (4, 0), (4, 4)] {
+            let row = row + pass * 2;
+            decoder.partial_decode(
+                &ArraySubset::new_with_ranges(&[row..row + 2, col..col + 2]),
+                &options,
+            )?;
         }
-        let read_reads = store.reads() - before;
-
-        println!(
-            "eager={eager}: {build_reads} reads to build, {read_reads} reads to decode, \
-             {} total",
-            build_reads + read_reads
-        );
-        measured.push((build_reads, read_reads));
     }
-
-    let (lazy_build, lazy_read) = measured[0];
-    let (eager_build, eager_read) = measured[1];
-
-    assert!(
-        eager_build > lazy_build,
-        "eager should read the inner indexes at construction: {eager_build} vs {lazy_build}"
-    );
-    assert!(
-        eager_read < lazy_read,
-        "and so decode should not read them again: {eager_read} vs {lazy_read}"
-    );
+    let eight_visits = store.reads() - before;
+    println!("eight visits to four inner shards: {eight_visits} reads");
     assert_eq!(
-        eager_build + eager_read,
-        lazy_build + lazy_read,
-        "touching every inner shard costs the same either way; eager only moves it"
+        eight_visits, 12,
+        "four inner indexes plus eight innermost chunks, not one index per visit"
     );
 
     Ok(())

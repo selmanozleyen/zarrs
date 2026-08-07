@@ -35,6 +35,7 @@ pub struct ShardingPartialDecoder {
     subchunk_shape: ChunkShape,
     inner_codecs: Arc<CodecChainBound>,
     shard_index: Option<Vec<u64>>,
+    #[expect(dead_code)] // TODO: Remove when sharding-specific options are added
     sharding_options: ShardingCodecOptions,
     /// Inner-chunk decoders kept across accesses, keyed by shard index entry.
     ///
@@ -85,51 +86,8 @@ impl ShardingPartialDecoder {
         // than one level in the local grid hierarchy is exactly that.
         if decoder.local_subchunk_grids(options)?.len() > 1 {
             decoder.subchunk_decoders = Some(Mutex::new(HashMap::new()));
-            if decoder.sharding_options.prefetch_subchunk_indexes() {
-                decoder.prefetch_subchunk_decoders(options)?;
-            }
         }
         Ok(decoder)
-    }
-
-    /// Build and keep every present inner chunk's decoder, reading each inner
-    /// index once, so later reads resolve without going to storage.
-    fn prefetch_subchunk_decoders(&self, options: &CodecOptions) -> Result<(), CodecError> {
-        let Some(shard_index) = self.shard_index.as_deref() else {
-            return Ok(());
-        };
-        for entry in 0..(shard_index.len() / 2) as u64 {
-            let offset = shard_index[entry as usize * 2];
-            let size = shard_index[entry as usize * 2 + 1];
-            if offset == u64::MAX && size == u64::MAX {
-                continue;
-            }
-            self.subchunk_decoder(entry, offset, size, options)?;
-        }
-        Ok(())
-    }
-
-    /// The decoder for one inner chunk, reusing a previously built one.
-    ///
-    /// `entry` is the chunk's index into the shard index, which is already
-    /// computed wherever an inner chunk is located.
-    fn subchunk_decoder(
-        &self,
-        entry: u64,
-        offset: ByteOffset,
-        size: ByteLength,
-        options: &CodecOptions,
-    ) -> Result<Arc<dyn ArrayPartialDecoderTraits>, CodecError> {
-        cached_subchunk_partial_decoder(
-            self.subchunk_decoders.as_ref(),
-            entry,
-            &self.input_handle,
-            &self.subchunk_shape,
-            &self.inner_codecs,
-            options,
-            offset,
-            size,
-        )
     }
 
     /// Retrieve the byte range of an encoded subchunk.
