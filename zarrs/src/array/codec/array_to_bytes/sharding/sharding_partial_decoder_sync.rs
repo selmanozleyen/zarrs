@@ -20,9 +20,10 @@ use crate::array::{
     IndexerError, ravel_indices,
 };
 use zarrs_codec::{
-    ArrayBytesDecodeIntoTarget, ArrayCodecTraits, ArrayPartialDecoderTraits,
-    ArrayToBytesCodecTraits, ByteIntervalPartialDecoder, BytesPartialDecoderTraits, CodecError,
-    CodecOptions, InvalidNumberOfElementsError, decode_into_array_bytes_target,
+    ArrayBytesDecodeIntoTarget, ArrayCodecTraits, ArrayPartialDecoderPlanned,
+    ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, ByteIntervalPartialDecoder,
+    BytesPartialDecoderTraits, CodecError, CodecOptions, InvalidNumberOfElementsError,
+    decode_into_array_bytes_target,
 };
 use zarrs_plugin::ExtensionAliasesV3;
 use zarrs_storage::StorageError;
@@ -291,6 +292,16 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
         }
     }
 
+    fn as_planned(&self) -> Option<&dyn ArrayPartialDecoderPlanned> {
+        Some(self)
+    }
+
+    fn supports_partial_decode(&self) -> bool {
+        self.input_handle.supports_partial_decode()
+    }
+}
+
+impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
     fn read_plan(
         &self,
         indexer: &dyn Indexer,
@@ -353,10 +364,6 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
             &mut output_view,
         )?;
         Ok(ArrayBytes::from(out))
-    }
-
-    fn supports_partial_decode(&self) -> bool {
-        self.input_handle.supports_partial_decode()
     }
 }
 

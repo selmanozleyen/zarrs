@@ -1,4 +1,4 @@
-//! `ArrayPartialDecoderTraits::read_plan` / `partial_decode_from_bytes`.
+//! `ArrayPartialDecoderPlanned::read_plan` / `partial_decode_from_bytes`.
 //!
 //! The point of the pair is that a caller holding several decoders can collect
 //! all of their reads, issue them together, and hand the bytes back. These
@@ -63,9 +63,10 @@ fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn
 
     let decoder = array.partial_decoder(&[0, 0])?;
     let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+    let planned = decoder.as_planned().expect("sharding can plan");
 
     let before = store.reads();
-    let plan = decoder
+    let plan = planned
         .read_plan(&subset, &options)?
         .expect("sharding reports its reads");
     assert_eq!(store.reads(), before, "planning must not perform any reads");
@@ -83,7 +84,7 @@ fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn
         .collect::<Result<Vec<_>, _>>()?;
 
     let before = store.reads();
-    let decoded = decoder
+    let decoded = planned
         .partial_decode_from_bytes(&subset, fetched, &options)?
         .into_fixed()?;
     assert_eq!(
@@ -107,13 +108,14 @@ fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     // Chunk [1, 1] was written; erase it so the shard is absent.
     array.erase_chunk(&[1, 1])?;
     let decoder = array.partial_decoder(&[1, 1])?;
-    let plan = decoder
+    let planned = decoder.as_planned().expect("sharding can plan");
+    let plan = planned
         .read_plan(&subset, &options)?
         .expect("sharding reports its reads");
     assert_eq!(plan.len(), 4, "one entry per inner chunk in the subset");
     assert!(plan.iter().all(Option::is_none), "nothing to read");
 
-    let decoded = decoder
+    let decoded = planned
         .partial_decode_from_bytes(&subset, vec![None; plan.len()], &options)?
         .into_fixed()?;
     assert_eq!(decoded, vec![0u8; 4 * 4 * 2], "fill value");
@@ -134,14 +136,17 @@ fn nested_sharding_reports_no_plan() -> Result<(), Box<dyn Error>> {
     let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
     let decoder = array.partial_decoder(&[0, 0])?;
 
+    // `as_planned` is about the decoder, not the selection: sharding plans
+    // some indexers, so it answers yes and `read_plan` declines this one.
+    let planned = decoder.as_planned().expect("sharding can plan");
     assert!(
-        decoder.read_plan(&subset, &options)?.is_none(),
+        planned.read_plan(&subset, &options)?.is_none(),
         "nested sharding must not report a one-level plan"
     );
 
     // With no plan and nothing supplied, it defers to `partial_decode`.
     let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
-    let decoded = decoder
+    let decoded = planned
         .partial_decode_from_bytes(&subset, Vec::new(), &options)?
         .into_fixed()?;
     assert_eq!(decoded, expected);
@@ -149,7 +154,7 @@ fn nested_sharding_reports_no_plan() -> Result<(), Box<dyn Error>> {
     // Bytes handed to a decoder that reported no plan were fetched against
     // something else. Discarding them and reading again would hide the
     // caller's mistake as unexplained I/O, so it fails instead.
-    let err = decoder
+    let err = planned
         .partial_decode_from_bytes(&subset, vec![None; 3], &options)
         .expect_err("supplying bytes without a plan must fail");
     assert!(
