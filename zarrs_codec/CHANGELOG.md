@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `UnboundArrayTo{Array,Bytes}CodecTraits`
 - Implement `[Async]BytesPartial{Encoder,Decoder}Traits` for `(Tstorage: *StorageTraits, StoreKey)`
 - Add `ChunkGrid{Encoded,Decoded}Ref` and `[Async]ArrayPartialDecoderTraits::local_subchunk_grid[s]` for chunk-local subchunk grids
+- Add `ArrayPartialDecoderPlanned` for decoders that can report their reads before performing them, reached through `ArrayPartialDecoderTraits::as_planned`
+  - Add `ReadPlan`, which carries the selection its byte ranges were computed for, and `CodecError::ReadPlanMismatch`
+- Implement `BytesPartialDecoderTraits` for `Bytes`, so bytes a store returned can be decoded without being copied into a `Vec` first
 
 ### Changed
 - **Breaking**: Refactor `ArrayTo{Array,Bytes}CodecTraits`
