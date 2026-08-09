@@ -8,9 +8,13 @@ use zarrs_storage::byte_range::ByteRange;
 /// Produced by
 /// [`read_plan`](crate::ArrayPartialDecoderPlanned::read_plan) and consumed by
 /// [`partial_decode_from_bytes`](crate::ArrayPartialDecoderPlanned::partial_decode_from_bytes),
-/// which reads the selection back off the plan rather than taking it again. That is the
-/// point of the type: the contract is *entry `i` corresponds to fetched bytes `i`*, and a
-/// plan that carries its own selection cannot be paired with a different one.
+/// which reads the selection back off the plan rather than taking it again. The contract
+/// is *entry `i` corresponds to fetched bytes `i`*.
+///
+/// A plan is not a value to pass around: it belongs to the decoder that produced it, and
+/// carries a [`source`](Self::source) so that decoder can recognise it. What the type
+/// itself guarantees is only that a plan cannot be paired with a *selection* other than
+/// its own; everything else is checked by the decoder when the plan comes back.
 ///
 /// A [`None`] entry marks a unit with nothing to read, which decodes to the fill value.
 /// Entries are never omitted, because their positions are the only thing tying the plan to
@@ -22,27 +26,47 @@ use zarrs_storage::byte_range::ByteRange;
 pub struct ReadPlan {
     subset: ArraySubset,
     byte_ranges: Vec<Option<ByteRange>>,
+    source: u64,
 }
 
 impl ReadPlan {
     /// Create a read plan for `subset` from one byte range per unit of encoded input.
     ///
-    /// For decoders producing a plan. Public only because a decoder generally lives in
-    /// another crate; callers have no reason to build one.
-    #[doc(hidden)]
+    /// For implementors of
+    /// [`ArrayPartialDecoderPlanned`](crate::ArrayPartialDecoderPlanned), which have to
+    /// return one. A caller has no reason to build a plan: a decoder will reject one it
+    /// would not have produced itself.
+    ///
+    /// `source` identifies the state the byte ranges were computed from, and is what a
+    /// decoder checks to know the plan is its own. Comparing the ranges is not enough:
+    /// two shards with equally sized chunks hold them at the same offsets, so their plans
+    /// are identical and each would otherwise accept the other's bytes.
     #[must_use]
-    pub const fn new(subset: ArraySubset, byte_ranges: Vec<Option<ByteRange>>) -> Self {
+    pub const fn new(
+        subset: ArraySubset,
+        byte_ranges: Vec<Option<ByteRange>>,
+        source: u64,
+    ) -> Self {
         Self {
             subset,
             byte_ranges,
+            source,
         }
+    }
+
+    /// The state the byte ranges were computed from, as the producing decoder reported it.
+    ///
+    /// For implementors, to reject a plan that is not their own.
+    #[must_use]
+    pub const fn source(&self) -> u64 {
+        self.source
     }
 
     /// The selection this plan describes the reads for.
     ///
-    /// For the decoder consuming the plan, which reads the selection back off it rather
-    /// than taking it again.
-    #[doc(hidden)]
+    /// For implementors, which read the selection back off the plan in
+    /// [`partial_decode_from_bytes`](crate::ArrayPartialDecoderPlanned::partial_decode_from_bytes)
+    /// rather than taking it again.
     #[must_use]
     pub const fn subset(&self) -> &ArraySubset {
         &self.subset

@@ -495,6 +495,53 @@ fn decode_from_bytes_into_an_offset_view() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// A plan from a *different array* with the same layout is still rejected.
+///
+/// This is the case comparing byte ranges cannot catch: two arrays written the
+/// same way hold their inner chunks at the same offsets, so both plans are the
+/// same list of ranges. Only the identity of the decoder that produced the plan
+/// tells them apart -- without it, one array's bytes decode as the other's and
+/// are returned as correct.
+#[test]
+fn a_plan_from_another_array_is_rejected() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array_a, store_a) = build(false)?;
+    let (array_b, _) = build(false)?;
+    let subset = ArraySubset::new_with_ranges(&[0..4, 0..4]);
+
+    let decoder_a = array_a.partial_decoder(&[0, 0])?;
+    let plan_a = decoder_a
+        .as_planned()
+        .expect("sharding can plan")
+        .read_plan(&subset, &options)?
+        .expect("sharding reports its reads");
+    let decoder_b = array_b.partial_decoder(&[0, 0])?;
+    let plan_b = decoder_b
+        .as_planned()
+        .expect("sharding can plan")
+        .read_plan(&subset, &options)?
+        .expect("sharding reports its reads");
+    assert_eq!(
+        plan_a.byte_ranges(),
+        plan_b.byte_ranges(),
+        "same layout, so the ranges alone cannot tell the two arrays apart"
+    );
+
+    // Bytes really fetched from A, handed to B's decoder.
+    let fetched = fetch(&store_a, &array_a.chunk_key(&[0, 0]), &plan_a)?;
+    let err = decoder_b
+        .as_planned()
+        .expect("sharding can plan")
+        .partial_decode_from_bytes(&plan_a, fetched, &options)
+        .expect_err("another array's plan must not be accepted");
+    assert!(
+        matches!(err, CodecError::ReadPlanMismatch),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
+}
+
 /// A plan from a shard whose index differs is rejected.
 ///
 /// The check compares byte ranges, and shard index offsets are shard-relative, so
@@ -559,7 +606,7 @@ fn an_out_of_bounds_selection_errors() -> Result<(), Box<dyn Error>> {
         // The same selection reaching the decode path as a hand-built plan.
         let err = planned
             .partial_decode_from_bytes(
-                &ReadPlan::new(oob.clone(), Vec::new()),
+                &ReadPlan::new(oob.clone(), Vec::new(), 0),
                 Vec::new(),
                 &options,
             )

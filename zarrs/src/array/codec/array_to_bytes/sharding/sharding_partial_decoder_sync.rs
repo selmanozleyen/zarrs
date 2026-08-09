@@ -23,8 +23,8 @@ use crate::array::{
 use zarrs_codec::{
     ArrayBytesDecodeIntoTarget, ArrayCodecTraits, ArrayPartialDecoderPlanned,
     ArrayPartialDecoderTraits, ArrayToBytesCodecTraits, ByteIntervalPartialDecoder,
-    BytesPartialDecoderTraits, CodecError, CodecOptions, InvalidNumberOfElementsError, ReadPlan,
-    decode_into_array_bytes_target,
+    BytesPartialDecoderTraits, CodecError, CodecOptions, ExpectedFixedLengthBytesError,
+    InvalidNumberOfElementsError, ReadPlan, decode_into_array_bytes_target,
 };
 use zarrs_plugin::ExtensionAliasesV3;
 use zarrs_storage::byte_range::{ByteLength, ByteOffset, ByteRange};
@@ -54,6 +54,14 @@ pub struct ShardingPartialDecoder {
     /// then name the wrong bytes of the stored value -- of the right length, so neither
     /// the caller nor the decode would notice. Planning is declined in that case.
     plannable_input: bool,
+    /// Identifies this decoder, so a plan can be recognised as its own.
+    ///
+    /// Neither the byte ranges nor the shard index distinguish shards: equally sized
+    /// inner chunks sit at the same offsets in every shard, so two shards of one array
+    /// have byte-identical indexes and byte-identical plans. Only identity separates
+    /// them, and a decoder is the thing that holds a shard's index, so identity is
+    /// per decoder.
+    plan_source: u64,
     /// Inner-chunk decoders kept across accesses, keyed by shard index entry.
     ///
     /// Building one of these decodes that chunk's own index when the inner
@@ -89,6 +97,12 @@ impl ShardingPartialDecoder {
         )?;
 
         let plannable_input = input_handle.byte_ranges_are_stored_offsets();
+        // A counter rather than a hash of anything: what has to be told apart is which
+        // shard the bytes came from, and two shards of one array are indistinguishable
+        // by content. Rebuilding a decoder therefore invalidates plans it did not make,
+        // which is the safe direction.
+        static PLAN_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let plan_source = PLAN_SOURCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut decoder = Self {
             input_handle,
             shard_shape,
@@ -98,6 +112,7 @@ impl ShardingPartialDecoder {
             sharding_options,
             nested: false,
             plannable_input,
+            plan_source,
             subchunk_decoders: None,
         };
 
@@ -341,6 +356,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         Ok(Some(ReadPlan::new(
             subset.to_array_subset(),
             planned.tasks.iter().map(SubchunkTask::byte_range).collect(),
+            self.plan_source,
         )))
     }
 
@@ -382,19 +398,22 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         output_target: ArrayBytesDecodeIntoTarget<'_>,
         options: &CodecOptions,
     ) -> Result<(), CodecError> {
-        // Only the fixed path is ever planned, so an optional target cannot belong to a
-        // plan this decoder produced.
-        let ArrayBytesDecodeIntoTarget::Fixed(output_view) = output_target else {
-            return Err(CodecError::ReadPlanMismatch);
-        };
-        let (subset, _, planned) = self.checked_tasks(plan, &fetched)?;
-        if subset.len() != output_view.num_elements() {
+        // Checked in the same order as the default implementation, so the two are
+        // substitutable: a caller gets the same error whichever one runs.
+        if plan.subset().num_elements() != output_target.num_elements() {
             return Err(InvalidNumberOfElementsError::new(
-                subset.len(),
-                output_view.num_elements(),
+                plan.subset().num_elements(),
+                output_target.num_elements(),
             )
             .into());
         }
+        // Only the fixed path is ever planned. The plan is not what is wrong here, so
+        // this does not report a plan mismatch.
+        let ArrayBytesDecodeIntoTarget::Fixed(output_view) = output_target else {
+            return Err(ExpectedFixedLengthBytesError.into());
+        };
+        let (_, _, planned) = self.checked_tasks(plan, &fetched)?;
+        let subset = plan.subset();
         // Straight into the caller's view: the inner chunks already decode into subdivisions
         // of whatever view they are given, so there is nothing for an owned buffer to do.
         partial_decode_fixed_array_subset_from_bytes_into(
@@ -437,7 +456,8 @@ impl ShardingPartialDecoder {
             subset,
         )?;
         let tasks = &planned.tasks;
-        if fetched.len() != tasks.len()
+        if plan.source() != self.plan_source
+            || fetched.len() != tasks.len()
             || plan.num_entries() != tasks.len()
             || izip!(plan.byte_ranges(), fetched, tasks).any(|(range, bytes, task)| {
                 *range != task.byte_range() || bytes.as_ref().map(Bytes::len) != task.fetched_len()

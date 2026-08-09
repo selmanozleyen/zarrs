@@ -123,7 +123,11 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
 /// out byte ranges must be able to decode the bytes that come back.
 ///
 /// Reach it through [`as_planned`](ArrayPartialDecoderTraits::as_planned).
-pub trait ArrayPartialDecoderPlanned: ArrayPartialDecoderTraits {
+///
+/// Deliberately not a subtrait of [`ArrayPartialDecoderTraits`]: neither method performs
+/// I/O, so nothing here is sync-specific, and an async decoder can implement this same
+/// trait rather than needing a duplicate of it.
+pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
     /// Report the reads [`partial_decode`](ArrayPartialDecoderTraits::partial_decode) would
     /// perform, without performing them.
     ///
@@ -181,9 +185,11 @@ pub trait ArrayPartialDecoderPlanned: ArrayPartialDecoderTraits {
     /// `output_target` should override it.
     ///
     /// # Errors
-    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder would
-    /// produce or `fetched` does not match it, [`CodecError`] if a codec fails, or if the
-    /// plan's selection and `output_target` hold different numbers of elements.
+    /// Returns [`InvalidNumberOfElementsError`] if the plan's selection and
+    /// `output_target` hold different numbers of elements,
+    /// [`CodecError::ExpectedFixedLengthBytes`] if `output_target` is a kind this decoder
+    /// does not plan, [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder
+    /// would produce or `fetched` does not match it, or [`CodecError`] if a codec fails.
     fn partial_decode_from_bytes_into(
         &self,
         plan: &ReadPlan,
