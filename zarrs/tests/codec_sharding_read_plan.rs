@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
+use zarrs::array::codec::{Crc32cCodec, GzipCodec};
 use zarrs::array::{
     Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset,
-    CodecError, CodecOptions, ReadPlan, UnboundArrayToBytesCodecTraits, data_type,
+    BytesToBytesCodecTraits, CodecError, CodecOptions, ReadPlan, UnboundArrayToBytesCodecTraits,
+    data_type,
 };
 use zarrs::storage::storage_adapter::performance_metrics::PerformanceMetricsStorageAdapter;
 use zarrs::storage::store::MemoryStore;
@@ -168,6 +170,60 @@ fn nested_sharding_reports_no_plan() -> Result<(), Box<dyn Error>> {
             .is_empty(),
         "the ordinary path still decodes it"
     );
+
+    Ok(())
+}
+
+/// A bytes-to-bytes codec outside the sharding codec means no plan.
+///
+/// The shard index's offsets are into whatever handle the decoder sits on. Put a
+/// decompressor or a prefix-stripper in between and those offsets no longer name
+/// the stored value, so a caller issuing them against the store reads the wrong
+/// bytes -- of the right length, so neither the caller nor the decode notices.
+/// The only safe answer is to decline.
+#[test]
+fn an_outer_bytes_codec_declines_planning() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+
+    for (label, outer) in [
+        (
+            "gzip",
+            Arc::new(GzipCodec::new(5)?) as Arc<dyn BytesToBytesCodecTraits>,
+        ),
+        (
+            "crc32c",
+            Arc::new(Crc32cCodec::new()) as Arc<dyn BytesToBytesCodecTraits>,
+        ),
+    ] {
+        let store = Arc::new(PerformanceMetricsStorageAdapter::new(Arc::new(
+            MemoryStore::default(),
+        )));
+        let data_type = data_type::uint16();
+        let mut builder = ArrayBuilder::new(vec![8, 8], vec![8, 8], data_type.clone(), 0u16);
+        builder.array_to_bytes_codec(Arc::new(
+            ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type).build(),
+        ));
+        builder.bytes_to_bytes_codecs(vec![outer]);
+        let array = builder.build_arc(store, "/array")?;
+        array.store_array_subset(&array.subset_all(), &(0..64u16).collect::<Vec<_>>())?;
+
+        let decoder = array.partial_decoder(&[0, 0])?;
+        let planned = decoder.as_planned().expect("sharding can plan");
+        assert!(
+            planned.read_plan(&subset, &options)?.is_none(),
+            "{label}: planned offsets that are not offsets into the stored value"
+        );
+        // Declining costs nothing but the plan: the ordinary path still reads it.
+        assert_eq!(
+            decoder
+                .partial_decode(&subset, &options)?
+                .into_fixed()?
+                .len(),
+            4 * 4 * 2,
+            "{label}: the ordinary path must still decode"
+        );
+    }
 
     Ok(())
 }

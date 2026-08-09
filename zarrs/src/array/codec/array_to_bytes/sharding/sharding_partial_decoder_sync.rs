@@ -46,6 +46,14 @@ pub struct ShardingPartialDecoder {
     /// planned call. Resolved with the options this decoder was built with, as the
     /// decoder cache below already was.
     nested: bool,
+    /// Whether the shard index's byte ranges are offsets into the stored value.
+    ///
+    /// They are offsets into `input_handle`, which is the stored value only when nothing
+    /// sits in between. A bytes-to-bytes codec *outside* the sharding codec puts a
+    /// decompressor or a prefix-stripper there, and a range reported to a caller would
+    /// then name the wrong bytes of the stored value -- of the right length, so neither
+    /// the caller nor the decode would notice. Planning is declined in that case.
+    plannable_input: bool,
     /// Inner-chunk decoders kept across accesses, keyed by shard index entry.
     ///
     /// Building one of these decodes that chunk's own index when the inner
@@ -80,6 +88,7 @@ impl ShardingPartialDecoder {
             options,
         )?;
 
+        let plannable_input = input_handle.byte_ranges_are_stored_offsets();
         let mut decoder = Self {
             input_handle,
             shard_shape,
@@ -88,6 +97,7 @@ impl ShardingPartialDecoder {
             shard_index,
             sharding_options,
             nested: false,
+            plannable_input,
             subchunk_decoders: None,
         };
 
@@ -445,6 +455,11 @@ impl ShardingPartialDecoder {
         &self,
         indexer: &'a dyn Indexer,
     ) -> Option<(&'a dyn ArraySubsetTraits, usize)> {
+        // A byte range is only worth reporting if the caller can issue it against the
+        // stored value and get the same bytes back.
+        if !self.plannable_input {
+            return None;
+        }
         // Only the fixed-size array subset path decodes one inner chunk per read.
         // Returning the size is what lets the decode path have it without asking
         // again and finding a case this rejected.

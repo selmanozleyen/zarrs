@@ -69,6 +69,21 @@ pub trait BytesPartialDecoderTraits: Any + MaybeSend + MaybeSync {
     /// If this returns `true`, the decoder can efficiently handle partial decoding operations.
     /// If this returns `false`, partial decoding will fall back to a full decode operation.
     fn supports_partial_decode(&self) -> bool;
+
+    /// Whether a byte range asked of this decoder is an offset into the stored value.
+    ///
+    /// Only then can a byte range be reported to a caller who will fetch it themselves,
+    /// which is what [`ArrayPartialDecoderPlanned`](crate::ArrayPartialDecoderPlanned)
+    /// does. A decoder that transforms the bytes it sits on -- decompressing them, or
+    /// stripping a prefix -- answers offsets in its own coordinates, and a caller issuing
+    /// those against the store would read the wrong bytes with nothing to notice it by.
+    ///
+    /// Defaults to [`false`], so a decoder that transforms bytes declines by saying
+    /// nothing. Override it only when a byte range passes through to the stored value
+    /// unchanged.
+    fn byte_ranges_are_stored_offsets(&self) -> bool {
+        false
+    }
 }
 
 /// Partial bytes encoder traits.
@@ -287,6 +302,11 @@ impl<TStorage: ReadableStorageTraits + 'static> BytesPartialDecoderTraits for (T
 
     fn supports_partial_decode(&self) -> bool {
         self.0.supports_get_partial()
+    }
+
+    fn byte_ranges_are_stored_offsets(&self) -> bool {
+        // This decoder *is* the stored value.
+        true
     }
 }
 
