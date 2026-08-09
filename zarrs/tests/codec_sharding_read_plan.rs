@@ -12,9 +12,10 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
+use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs::array::{
-    Array, ArrayBuilder, ArraySubset, CodecError, CodecOptions, ReadPlan,
-    UnboundArrayToBytesCodecTraits, data_type,
+    Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset,
+    CodecError, CodecOptions, ReadPlan, UnboundArrayToBytesCodecTraits, data_type,
 };
 use zarrs::storage::storage_adapter::performance_metrics::PerformanceMetricsStorageAdapter;
 use zarrs::storage::store::MemoryStore;
@@ -254,6 +255,60 @@ fn fetched_bytes_must_match_the_plan() -> Result<(), Box<dyn Error>> {
     let short = fetched[0].as_ref().expect("chunk was written").slice(1..);
     fetched[0] = Some(short);
     reject(fetched, "bytes of the wrong length");
+
+    Ok(())
+}
+
+/// `partial_decode_from_bytes_into` writes into the caller's view, at the view's
+/// own origin rather than at the shard's.
+///
+/// The offset is the whole point: a caller assembling one array from several
+/// decoders gives each a different corner of it, and a decoder that ignored the
+/// view's start would overwrite its neighbours.
+#[test]
+fn decode_from_bytes_into_an_offset_view() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(false)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+    let plan = planned
+        .read_plan(&subset, &options)?
+        .expect("sharding reports its reads");
+    let expected = planned
+        .partial_decode_from_bytes(&plan, fetch(&store, &key, &plan)?, &options)?
+        .into_fixed()?;
+
+    // An [8, 8] output with the 4x4 result dropped at [3, 2], prefilled with a
+    // sentinel so anything written outside the target subset shows up.
+    let element_size = 2;
+    let output_shape = [8u64, 8];
+    let mut output = vec![0xAAu8; 8 * 8 * element_size];
+    {
+        let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+        let mut view = unsafe {
+            ArrayBytesFixedDisjointView::new(
+                output_slice,
+                element_size,
+                &output_shape,
+                ArraySubset::new_with_ranges(&[3..7, 2..6]),
+            )?
+        };
+        planned.partial_decode_from_bytes_into(
+            &plan,
+            fetch(&store, &key, &plan)?,
+            ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+            &options,
+        )?;
+    }
+
+    let mut want = vec![0xAAu8; 8 * 8 * element_size];
+    for (row, chunk) in expected.chunks_exact(4 * element_size).enumerate() {
+        let start = ((3 + row) * 8 + 2) * element_size;
+        want[start..start + chunk.len()].copy_from_slice(chunk);
+    }
+    assert_eq!(output, want, "decoded into the wrong place, or spilled");
 
     Ok(())
 }

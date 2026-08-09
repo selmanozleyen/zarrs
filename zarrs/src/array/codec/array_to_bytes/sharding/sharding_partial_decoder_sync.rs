@@ -340,35 +340,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         fetched: Vec<MaybeBytes>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError> {
-        // A selection this decoder does not plan -- nested sharding, a variable-size
-        // type -- cannot have produced this plan, so something else did.
-        let Some((subset, data_type_size)) = self.planned_subset(plan.subset()) else {
-            return Err(CodecError::ReadPlanMismatch);
-        };
-        let planned = plan_subchunk_tasks(
-            &self.shard_shape,
-            &self.subchunk_shape,
-            self.shard_index.as_deref(),
-            subset,
-        )?;
-        let tasks = &planned.tasks;
-        // The plan and the bytes are the caller's claims about what was read. Rebuilding
-        // the plan is cheap -- the shard index is resident, and the decode needs the
-        // geometry anyway -- so check both against what this decoder would have done:
-        // one entry per inner chunk, the same range for each, and bytes of the length that
-        // range asks for.
-        //
-        // What this cannot catch is a permutation of entries whose ranges are all the same
-        // length, which is the usual case for uncompressed inner chunks. Order is the
-        // caller's side of the contract.
-        if fetched.len() != tasks.len()
-            || plan.num_entries() != tasks.len()
-            || izip!(plan.byte_ranges(), &fetched, tasks).any(|(range, bytes, task)| {
-                *range != task.byte_range() || bytes.as_ref().map(Bytes::len) != task.fetched_len()
-            })
-        {
-            return Err(CodecError::ReadPlanMismatch);
-        }
+        let (subset, data_type_size, planned) = self.checked_tasks(plan, &fetched)?;
 
         let array_shape = subset.shape();
         let mut out = vec![0; subset.num_elements_usize() * data_type_size];
@@ -392,9 +364,78 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         )?;
         Ok(ArrayBytes::from(out))
     }
+
+    fn partial_decode_from_bytes_into(
+        &self,
+        plan: &ReadPlan,
+        fetched: Vec<MaybeBytes>,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        // Only the fixed path is ever planned, so an optional target cannot belong to a
+        // plan this decoder produced.
+        let ArrayBytesDecodeIntoTarget::Fixed(output_view) = output_target else {
+            return Err(CodecError::ReadPlanMismatch);
+        };
+        let (subset, _, planned) = self.checked_tasks(plan, &fetched)?;
+        if subset.len() != output_view.num_elements() {
+            return Err(
+                InvalidNumberOfElementsError::new(subset.len(), output_view.num_elements()).into(),
+            );
+        }
+        // Straight into the caller's view: the inner chunks already decode into subdivisions
+        // of whatever view they are given, so there is nothing for an owned buffer to do.
+        partial_decode_fixed_array_subset_from_bytes_into(
+            &self.subchunk_shape,
+            &self.inner_codecs,
+            planned,
+            subset,
+            fetched,
+            options,
+            output_view,
+        )
+    }
 }
 
 impl ShardingPartialDecoder {
+    /// The geometry a plan describes, once the plan and the bytes fetched for it have been
+    /// checked against the reads this decoder would perform.
+    ///
+    /// Rebuilding the plan is cheap -- the shard index is resident, and the decode needs the
+    /// geometry anyway -- so both decode entry points check: one entry per inner chunk, the
+    /// same range for each, and bytes of the length that range asks for.
+    ///
+    /// What this cannot catch is a permutation of entries whose ranges are all the same
+    /// length, which is the usual case for uncompressed inner chunks. Order is the caller's
+    /// side of the contract.
+    fn checked_tasks<'a>(
+        &self,
+        plan: &'a ReadPlan,
+        fetched: &[MaybeBytes],
+    ) -> Result<(&'a dyn ArraySubsetTraits, usize, SubchunkTasks), CodecError> {
+        // A selection this decoder does not plan -- nested sharding, a variable-size
+        // type -- cannot have produced this plan, so something else did.
+        let Some((subset, data_type_size)) = self.planned_subset(plan.subset()) else {
+            return Err(CodecError::ReadPlanMismatch);
+        };
+        let planned = plan_subchunk_tasks(
+            &self.shard_shape,
+            &self.subchunk_shape,
+            self.shard_index.as_deref(),
+            subset,
+        )?;
+        let tasks = &planned.tasks;
+        if fetched.len() != tasks.len()
+            || plan.num_entries() != tasks.len()
+            || izip!(plan.byte_ranges(), fetched, tasks).any(|(range, bytes, task)| {
+                *range != task.byte_range() || bytes.as_ref().map(Bytes::len) != task.fetched_len()
+            })
+        {
+            return Err(CodecError::ReadPlanMismatch);
+        }
+        Ok((subset, data_type_size, planned))
+    }
+
     /// The array subset a read plan can be built for and the size of one of its
     /// elements, or [`None`] if this indexer takes a path that does not read one
     /// inner chunk per range.

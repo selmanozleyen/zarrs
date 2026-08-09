@@ -171,6 +171,36 @@ pub trait ArrayPartialDecoderPlanned: ArrayPartialDecoderTraits {
         fetched: Vec<MaybeBytes>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError>;
+
+    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes) into a preallocated
+    /// output.
+    ///
+    /// A caller assembling one output from several decoders wants this rather than the
+    /// owned form, which has to allocate a buffer per call and copy it into place. The
+    /// default does exactly that; an implementor that can decode straight into
+    /// `output_target` should override it.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder would
+    /// produce or `fetched` does not match it, [`CodecError`] if a codec fails, or if the
+    /// plan's selection and `output_target` hold different numbers of elements.
+    fn partial_decode_from_bytes_into(
+        &self,
+        plan: &ReadPlan,
+        fetched: Vec<MaybeBytes>,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        if plan.subset().num_elements() != output_target.num_elements() {
+            return Err(InvalidNumberOfElementsError::new(
+                plan.subset().num_elements(),
+                output_target.num_elements(),
+            )
+            .into());
+        }
+        let decoded = self.partial_decode_from_bytes(plan, fetched, options)?;
+        decode_into_array_bytes_target(&decoded, output_target)
+    }
 }
 
 /// Partial array encoder traits.
