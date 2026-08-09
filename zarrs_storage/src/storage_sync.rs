@@ -62,6 +62,25 @@ pub trait ReadableStorageTraits: MaybeSend + MaybeSync {
     /// Returns a [`StorageError`] if there is an underlying storage error.
     fn size_key(&self, key: &StoreKey) -> Result<Option<u64>, StorageError>;
 
+    /// Advise the store that these byte ranges of `key` will be read soon.
+    ///
+    /// A hint, not a request: it starts the read without waiting for it, so a
+    /// caller that knows every range it will need -- as one holding a read plan
+    /// does -- can get them underway without a thread parked on each. Stores
+    /// that cannot express this ignore it, which is why the default does
+    /// nothing and why a failure is not an error.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] only if the store fails in a way the caller
+    /// should know about. Being unable to hint is not such a failure.
+    fn hint_will_read(
+        &self,
+        _key: &StoreKey,
+        _byte_ranges: &[crate::byte_range::ByteRange],
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Returns whether this store supports partial reads.
     ///
     /// If this returns `true`, the store can efficiently handle `get_partial` and `get_partial_many` operations.
