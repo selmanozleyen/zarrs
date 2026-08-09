@@ -182,6 +182,35 @@ fn is_valid(byte_range: ByteRange, bytes_len: u64) -> bool {
     }
 }
 
+/// Extract byte ranges from bytes, as slices of them.
+///
+/// Prefer this to [`extract_byte_ranges`] where the extracted bytes do not have to
+/// outlive `bytes`, since it copies nothing.
+///
+/// # Errors
+/// Returns [`InvalidByteRangeError`] if any bytes are requested beyond the end of `bytes`.
+///
+/// # Panics
+/// Panics if requesting bytes beyond [`usize::MAX`].
+pub fn extract_byte_ranges_ref<R: Into<ByteRange>>(
+    bytes: &[u8],
+    byte_ranges: impl Iterator<Item = R>,
+) -> Result<Vec<&[u8]>, InvalidByteRangeError> {
+    let bytes_len = bytes.len() as u64;
+    byte_ranges
+        .map(|byte_range| {
+            let byte_range: ByteRange = byte_range.into();
+            let valid = is_valid(byte_range, bytes_len);
+            if !valid {
+                return Err(InvalidByteRangeError(byte_range, bytes_len));
+            }
+            let start = usize::try_from(byte_range.start(bytes_len)).unwrap();
+            let end = usize::try_from(byte_range.end(bytes_len)).unwrap();
+            Ok(&bytes[start..end])
+        })
+        .collect::<Result<Vec<&[u8]>, InvalidByteRangeError>>()
+}
+
 /// Extract byte ranges from bytes.
 ///
 /// # Errors
@@ -193,19 +222,10 @@ pub fn extract_byte_ranges<R: Into<ByteRange>>(
     bytes: &[u8],
     byte_ranges: impl Iterator<Item = R>,
 ) -> Result<Vec<Vec<u8>>, InvalidByteRangeError> {
-    let bytes_len = bytes.len() as u64;
-    byte_ranges
-        .map(|byte_range| {
-            let byte_range: ByteRange = byte_range.into();
-            let valid = is_valid(byte_range, bytes_len);
-            if !valid {
-                return Err(InvalidByteRangeError(byte_range, bytes_len));
-            }
-            let start = usize::try_from(byte_range.start(bytes.len() as u64)).unwrap();
-            let end = usize::try_from(byte_range.end(bytes.len() as u64)).unwrap();
-            Ok(bytes[start..end].to_vec())
-        })
-        .collect::<Result<Vec<Vec<u8>>, InvalidByteRangeError>>()
+    Ok(extract_byte_ranges_ref(bytes, byte_ranges)?
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 /// Extract byte ranges from bytes and concatenate.

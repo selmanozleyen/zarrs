@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use zarrs_plugin::{MaybeSend, MaybeSync};
 use zarrs_storage::byte_range::{
-    ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges,
+    ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges_ref,
 };
 use zarrs_storage::{
     Bytes, OffsetBytesIterator, ReadableStorageTraits, ReadableWritableStorageTraits, StorageError,
@@ -126,9 +126,9 @@ impl BytesPartialDecoderTraits for Cow<'static, [u8]> {
         _parallel: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
         Ok(Some(
-            extract_byte_ranges(self, decoded_regions)?
+            extract_byte_ranges_ref(self, decoded_regions)?
                 .into_iter()
-                .map(Cow::Owned)
+                .map(Cow::Borrowed)
                 .collect(),
         ))
     }
@@ -154,9 +154,9 @@ impl BytesPartialDecoderTraits for Bytes {
         _parallel: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
         Ok(Some(
-            extract_byte_ranges(self, decoded_regions)?
+            extract_byte_ranges_ref(self, decoded_regions)?
                 .into_iter()
-                .map(Cow::Owned)
+                .map(Cow::Borrowed)
                 .collect(),
         ))
     }
@@ -181,9 +181,9 @@ impl BytesPartialDecoderTraits for Vec<u8> {
         _parallel: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
         Ok(Some(
-            extract_byte_ranges(self, decoded_regions)?
+            extract_byte_ranges_ref(self, decoded_regions)?
                 .into_iter()
-                .map(Cow::Owned)
+                .map(Cow::Borrowed)
                 .collect(),
         ))
     }
