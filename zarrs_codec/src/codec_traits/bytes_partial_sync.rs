@@ -7,7 +7,7 @@ use zarrs_storage::byte_range::{
     ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges,
 };
 use zarrs_storage::{
-    OffsetBytesIterator, ReadableStorageTraits, ReadableWritableStorageTraits, StorageError,
+    Bytes, OffsetBytesIterator, ReadableStorageTraits, ReadableWritableStorageTraits, StorageError,
     StoreKey,
 };
 
@@ -118,6 +118,34 @@ impl BytesPartialDecoderTraits for Cow<'static, [u8]> {
 
     fn size_held(&self) -> usize {
         self.as_ref().len()
+    }
+
+    fn partial_decode_many(
+        &self,
+        decoded_regions: ByteRangeIterator,
+        _parallel: &CodecOptions,
+    ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
+        Ok(Some(
+            extract_byte_ranges(self, decoded_regions)?
+                .into_iter()
+                .map(Cow::Owned)
+                .collect(),
+        ))
+    }
+
+    fn supports_partial_decode(&self) -> bool {
+        true
+    }
+}
+
+/// Decode from bytes a store already handed back, without copying them first.
+impl BytesPartialDecoderTraits for Bytes {
+    fn exists(&self) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    fn size_held(&self) -> usize {
+        self.len()
     }
 
     fn partial_decode_many(
