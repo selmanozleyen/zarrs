@@ -106,6 +106,11 @@ impl FilesystemStoreOptions {
 struct CachedFile {
     file: RandomAccessFile,
     size: u64,
+    /// The descriptor the file was opened on, for ioctls that `RandomAccessFile`
+    /// does not expose. Owned by `file`, so it is valid exactly as long as this
+    /// struct is, and costs no extra descriptor.
+    #[cfg(target_os = "linux")]
+    fd: std::os::unix::io::RawFd,
 }
 
 /// A synchronous file system store.
@@ -217,7 +222,9 @@ impl FilesystemStore {
             }
         }
 
-        let file = match RandomAccessFile::open(self.key_to_fspath(key)) {
+        // Opened as a `File` first so the descriptor can be recorded; `try_new`
+        // does the same platform setup `RandomAccessFile::open` would.
+        let opened = match std::fs::File::open(self.key_to_fspath(key)) {
             Ok(file) => file,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -226,9 +233,20 @@ impl FilesystemStore {
                 return Err(err.into());
             }
         };
+        #[cfg(target_os = "linux")]
+        let fd = {
+            use std::os::unix::io::AsRawFd;
+            opened.as_raw_fd()
+        };
+        let file = RandomAccessFile::try_new(opened)?;
         let size = positioned_io::Size::size(&file)?
             .ok_or_else(|| StorageError::Other("Could not determine file size".to_string()))?;
-        let handle = Arc::new(CachedFile { file, size });
+        let handle = Arc::new(CachedFile {
+            file,
+            size,
+            #[cfg(target_os = "linux")]
+            fd,
+        });
 
         if let Some(cache) = &self.handle_cache {
             cache.lock().unwrap().put(key.clone(), handle.clone());
@@ -414,6 +432,96 @@ impl FilesystemStore {
     }
 }
 
+/// Lustre's own read advice, via `LL_IOC_LADVISE`.
+///
+/// `posix_fadvise` reaches only the client's page cache; this reaches the OSTs.
+/// Measured on a scattered read of 9192 x 83 KiB over one shard set, it took 32
+/// reader threads from 181 MiB/s to 628 -- i.e. a modest thread count reaches
+/// what otherwise needs several times as many, because the read is started
+/// without a thread waiting on it.
+#[cfg(target_os = "linux")]
+mod ladvise {
+    use std::os::unix::io::RawFd;
+
+    /// Read off `lfs ladvise` under strace rather than copied from a header:
+    /// `_IOC(_IOC_READ, 0x66, 0xfa, 0x20)`.
+    const LL_IOC_LADVISE: libc::c_ulong = 0x8020_66FA;
+    const LADVISE_MAGIC: u32 = 0x1ADF_1CE0;
+    const LU_LADVISE_WILLREAD: u16 = 1;
+    /// Without this the ioctl waits for the prefetch to complete, which is a
+    /// hundredfold slower than not hinting at all (112 s against 0.9 s on the
+    /// run above). It is not an optimisation, it is the whole point.
+    const LF_ASYNC: u64 = 0x1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct LuLadvise {
+        advice: u16,
+        value1: u16,
+        value2: u32,
+        start: u64,
+        end: u64,
+        value3: u32,
+        value4: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct LadviseHdr {
+        magic: u32,
+        count: u32,
+        flags: u64,
+        value1: u32,
+        value2: u32,
+        value3: u64,
+    }
+
+    /// One ioctl for every range wanted from this file.
+    ///
+    /// Batched because the cost is per call, not per range: hinting one range at
+    /// a time through `lfs ladvise` costs ~21 ms each, while one ioctl carrying
+    /// thousands is immediate.
+    pub(crate) fn will_read(fd: RawFd, ranges: &[(u64, u64)]) -> std::io::Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let hdr_size = std::mem::size_of::<LadviseHdr>();
+        let adv_size = std::mem::size_of::<LuLadvise>();
+        let mut buf = vec![0u8; hdr_size + ranges.len() * adv_size];
+        let hdr = LadviseHdr {
+            magic: LADVISE_MAGIC,
+            count: u32::try_from(ranges.len()).unwrap_or(u32::MAX),
+            flags: LF_ASYNC,
+            ..Default::default()
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (&raw const hdr).cast::<u8>(),
+                buf.as_mut_ptr(),
+                hdr_size,
+            );
+            for (i, (start, end)) in ranges.iter().enumerate() {
+                let advise = LuLadvise {
+                    advice: LU_LADVISE_WILLREAD,
+                    start: *start,
+                    end: *end,
+                    ..Default::default()
+                };
+                std::ptr::copy_nonoverlapping(
+                    (&raw const advise).cast::<u8>(),
+                    buf.as_mut_ptr().add(hdr_size + i * adv_size),
+                    adv_size,
+                );
+            }
+            if libc::ioctl(fd, LL_IOC_LADVISE, buf.as_ptr()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+}
+
 impl ReadableStorageTraits for FilesystemStore {
     fn get_partial_many<'a>(
         &'a self,
@@ -478,6 +586,32 @@ impl ReadableStorageTraits for FilesystemStore {
 
     fn supports_get_partial(&self) -> bool {
         true
+    }
+
+    fn hint_will_read(
+        &self,
+        key: &StoreKey,
+        byte_ranges: &[ByteRange],
+    ) -> Result<(), StorageError> {
+        // Direct I/O bypasses the page cache the hint would populate, so there is
+        // nothing for it to do.
+        #[cfg(target_os = "linux")]
+        if !self.options.direct_io {
+            let Some(handle) = self.open_or_cached(key)? else {
+                return Ok(()); // absent key: nothing to prefetch, not an error
+            };
+            let size = handle.size;
+            let ranges: Vec<(u64, u64)> = byte_ranges
+                .iter()
+                .map(|byte_range| (byte_range.start(size), byte_range.end(size)))
+                .collect();
+            // A store that cannot hint is not a store that has failed: on a
+            // non-Lustre filesystem this returns ENOTTY every time, and the read
+            // that follows is unaffected.
+            let _ = ladvise::will_read(handle.fd, &ranges);
+        }
+        let _ = (key, byte_ranges);
+        Ok(())
     }
 }
 
