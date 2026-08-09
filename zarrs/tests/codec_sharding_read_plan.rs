@@ -11,8 +11,8 @@ use std::error::Error;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
 use unsafe_cell_slice::UnsafeCellSlice;
+use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
 use zarrs::array::{
     Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset,
     CodecError, CodecOptions, ReadPlan, UnboundArrayToBytesCodecTraits, data_type,
@@ -167,6 +167,132 @@ fn nested_sharding_reports_no_plan() -> Result<(), Box<dyn Error>> {
             .into_fixed()?
             .is_empty(),
         "the ordinary path still decodes it"
+    );
+
+    Ok(())
+}
+
+/// Nesting changes where bytes live, not what they decode to.
+///
+/// The outer level still goes through the shared subchunk geometry, so this is
+/// what catches that path being wrong for nested shards specifically -- the
+/// planned tests cannot cover it, because nesting declines to plan.
+#[test]
+fn nested_sharding_decodes_the_same_values() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (flat, _) = build(false)?;
+    let (nested, _) = build(true)?;
+
+    let flat_decoder = flat.partial_decoder(&[0, 0])?;
+    let nested_decoder = nested.partial_decoder(&[0, 0])?;
+    for ranges in [
+        &[0..2, 0..2][..], // inside one inner shard
+        &[1..3, 1..3][..], // straddling four inner chunks of the inner shard
+        &[3..5, 2..7][..], // straddling inner shards
+        &[0..8, 0..8][..], // the whole shard
+    ] {
+        let subset = ArraySubset::new_with_ranges(ranges);
+        let want = flat_decoder
+            .partial_decode(&subset, &options)?
+            .into_fixed()?;
+        let got = nested_decoder
+            .partial_decode(&subset, &options)?
+            .into_fixed()?;
+        assert_eq!(got, want, "subset {ranges:?}");
+    }
+
+    Ok(())
+}
+
+/// Nesting declines every selection, not just the one the other test uses.
+///
+/// `as_planned` answers for the decoder and `read_plan` for the selection, so a
+/// nested decoder saying yes to the first and no to the second is the shape the
+/// caller has to handle for every subset it asks about.
+#[test]
+fn nested_sharding_declines_every_subset() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, _) = build(true)?;
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+
+    for ranges in [
+        &[0..2, 0..2][..],
+        &[1..3, 1..3][..],
+        &[3..5, 2..7][..],
+        &[0..8, 0..8][..],
+        &[4..8, 4..8][..], // exactly one inner shard
+    ] {
+        let subset = ArraySubset::new_with_ranges(ranges);
+        assert!(
+            planned.read_plan(&subset, &options)?.is_none(),
+            "planned {ranges:?}, which would name whole inner shards"
+        );
+    }
+
+    Ok(())
+}
+
+/// A plan from a flat array is rejected by a nested decoder, on both entry points.
+///
+/// The two arrays have the same shape and shard shape, so the selection is valid
+/// for either. Nothing but the nesting check stands between the caller and inner
+/// shard bytes decoded as if they were inner chunks.
+#[test]
+fn a_flat_plan_is_rejected_by_a_nested_decoder() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (flat, store) = build(false)?;
+    let (nested, _) = build(true)?;
+    let key: StoreKey = flat.chunk_key(&[0, 0]);
+    let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+
+    let flat_decoder = flat.partial_decoder(&[0, 0])?;
+    let plan = flat_decoder
+        .as_planned()
+        .expect("sharding can plan")
+        .read_plan(&subset, &options)?
+        .expect("the flat array plans");
+    let fetched = fetch(&store, &key, &plan)?;
+
+    let nested_decoder = nested.partial_decoder(&[0, 0])?;
+    let nested_planned = nested_decoder.as_planned().expect("sharding can plan");
+
+    let err = nested_planned
+        .partial_decode_from_bytes(&plan, fetched, &options)
+        .expect_err("a nested decoder must not consume a flat plan");
+    assert!(
+        matches!(err, CodecError::ReadPlanMismatch),
+        "unexpected error: {err}"
+    );
+
+    // The same must hold for the decode-into entry point, which has its own
+    // validation path.
+    let element_size = 2;
+    let mut output = vec![0u8; 4 * 4 * element_size];
+    let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+    let mut view = unsafe {
+        ArrayBytesFixedDisjointView::new(
+            output_slice,
+            element_size,
+            &[4, 4],
+            ArraySubset::new_with_shape(vec![4, 4]),
+        )?
+    };
+    let err = nested_planned
+        .partial_decode_from_bytes_into(
+            &plan,
+            fetch(&store, &key, &plan)?,
+            ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+            &options,
+        )
+        .expect_err("decode-into must reject it too");
+    assert!(
+        matches!(err, CodecError::ReadPlanMismatch),
+        "unexpected error: {err}"
+    );
+    assert!(
+        output.iter().all(|byte| *byte == 0),
+        "a rejected plan must not have written anything"
     );
 
     Ok(())

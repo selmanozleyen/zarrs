@@ -379,9 +379,11 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         };
         let (subset, _, planned) = self.checked_tasks(plan, &fetched)?;
         if subset.len() != output_view.num_elements() {
-            return Err(
-                InvalidNumberOfElementsError::new(subset.len(), output_view.num_elements()).into(),
-            );
+            return Err(InvalidNumberOfElementsError::new(
+                subset.len(),
+                output_view.num_elements(),
+            )
+            .into());
         }
         // Straight into the caller's view: the inner chunks already decode into subdivisions
         // of whatever view they are given, so there is nothing for an owned buffer to do.
