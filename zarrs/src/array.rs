@@ -71,7 +71,7 @@ pub use zarrs_codec::{
     ArrayToBytesCodecTraits, BytesPartialDecoderTraits, BytesPartialEncoderTraits,
     BytesRepresentation, BytesToBytesCodecTraits, ChunkGridDecoded, ChunkGridDecodedRef, Codec,
     CodecCreateError, CodecError, CodecMetadataOptions, CodecOptions, CodecSpecificOptions,
-    CodecTraits, CodecTraitsV2, CodecTraitsV3, RecommendedConcurrency,
+    CodecTraits, CodecTraitsV2, CodecTraitsV3, ReadPlan, RecommendedConcurrency,
     UnboundArrayToArrayCodecTraits, UnboundArrayToBytesCodecTraits, copy_fill_value_into,
     update_array_bytes,
 };

@@ -3,12 +3,11 @@ use std::any::Any;
 use zarrs_chunk_grid::{ChunkGrid, Indexer};
 use zarrs_data_type::DataType;
 use zarrs_plugin::{MaybeSend, MaybeSync};
-use zarrs_storage::StorageError;
-use zarrs_storage::byte_range::ByteRange;
+use zarrs_storage::{MaybeBytes, StorageError};
 
 use crate::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesRaw, CodecError, CodecOptions,
-    InvalidNumberOfElementsError, decode_into_array_bytes_target,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, CodecError, CodecOptions, InvalidNumberOfElementsError,
+    ReadPlan, decode_into_array_bytes_target,
 };
 
 /// Partial array decoder traits.
@@ -128,12 +127,6 @@ pub trait ArrayPartialDecoderPlanned: ArrayPartialDecoderTraits {
     /// Report the reads [`partial_decode`](ArrayPartialDecoderTraits::partial_decode) would
     /// perform, without performing them.
     ///
-    /// Returns one entry per unit of encoded input, in the order
-    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes) expects them back.
-    /// A [`None`] entry marks a unit with nothing to read, which decodes to the fill value.
-    /// Entries are never omitted, because their positions are the only thing tying the
-    /// plan to the bytes returned for it.
-    ///
     /// This lets a caller holding several decoders issue all of their reads together and
     /// schedule them as a whole, rather than one decoder at a time. It is worthwhile when
     /// a read costs far more than the decode it feeds, which is the usual case for a
@@ -150,20 +143,32 @@ pub trait ArrayPartialDecoderPlanned: ArrayPartialDecoderTraits {
         &self,
         indexer: &dyn Indexer,
         options: &CodecOptions,
-    ) -> Result<Option<Vec<Option<ByteRange>>>, CodecError>;
+    ) -> Result<Option<ReadPlan>, CodecError>;
 
     /// Partially decode a chunk from encoded bytes the caller already fetched.
     ///
-    /// `fetched` must correspond one-to-one, and in order, with the plan returned by
-    /// [`read_plan`](Self::read_plan) for the same `indexer`. The call performs no I/O.
+    /// `fetched` must correspond one-to-one, and in order, with `plan`. The selection comes
+    /// from the plan, so there is no second selection to keep matched to it. The call
+    /// performs no I/O.
+    ///
+    /// Entries are [`MaybeBytes`] -- exactly what a store hands back -- so the caller does
+    /// not have to convert or copy them to hand them over. A [`None`] entry is one the plan
+    /// said there was nothing to read for.
+    ///
+    /// The implementation checks `plan` and `fetched` against the reads it would have
+    /// performed itself: the number of entries, the range of each, and the length of the
+    /// bytes supplied for it. It cannot check the *order*, since entries of equal length
+    /// are indistinguishable, so handing back bytes in plan order is the caller's side of
+    /// the contract.
     ///
     /// # Errors
-    /// Returns [`CodecError`] if a codec fails, an array subset is invalid, or `fetched`
-    /// does not match the plan.
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder would
+    /// produce or `fetched` does not match it, [`CodecError::IncompatibleIndexer`] if the
+    /// plan's selection is invalid for this decoder, or [`CodecError`] if a codec fails.
     fn partial_decode_from_bytes(
         &self,
-        indexer: &dyn Indexer,
-        fetched: Vec<Option<ArrayBytesRaw<'static>>>,
+        plan: &ReadPlan,
+        fetched: Vec<MaybeBytes>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError>;
 }
