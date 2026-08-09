@@ -30,22 +30,18 @@ const fn nz(v: u64) -> NonZeroU64 {
 /// Do the plan's reads, in whatever order the caller likes.
 ///
 /// What the store returns goes straight back to the decoder -- no copy, and no
-/// conversion to talk it into the decoder's argument type.
+/// conversion to talk it into the decoder's argument type. Entries with nothing to
+/// read keep their place without being visited, which is what `reads` is for.
 fn fetch(
     store: &TestStore,
     key: &StoreKey,
     plan: &ReadPlan,
 ) -> Result<Vec<MaybeBytes>, Box<dyn Error>> {
-    plan.byte_ranges()
-        .iter()
-        .map(|byte_range| {
-            byte_range
-                .map(|byte_range| store.get_partial(key, byte_range))
-                .transpose()
-                .map(Option::flatten)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let mut fetched = vec![None; plan.num_entries()];
+    for (entry, byte_range) in plan.reads() {
+        fetched[entry] = store.get_partial(key, byte_range)?;
+    }
+    Ok(fetched)
 }
 
 /// A `[16, 16]` `uint16` array in `[8, 8]` shards of `[2, 2]` inner chunks.
@@ -125,14 +121,16 @@ fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     let plan = planned
         .read_plan(&subset, &options)?
         .expect("sharding reports its reads");
-    assert_eq!(plan.len(), 4, "one entry per inner chunk in the subset");
-    assert!(
-        plan.byte_ranges().iter().all(Option::is_none),
-        "nothing to read"
+    assert_eq!(
+        plan.num_entries(),
+        4,
+        "one entry per inner chunk in the subset"
     );
+    assert_eq!(plan.reads().count(), 0, "but nothing to read");
+    assert!(!plan.is_empty(), "entries without reads are still entries");
 
     let decoded = planned
-        .partial_decode_from_bytes(&plan, vec![None; plan.len()], &options)?
+        .partial_decode_from_bytes(&plan, vec![None; plan.num_entries()], &options)?
         .into_fixed()?;
     assert_eq!(decoded, vec![0u8; 4 * 4 * 2], "fill value");
 
@@ -242,11 +240,14 @@ fn fetched_bytes_must_match_the_plan() -> Result<(), Box<dyn Error>> {
         );
     };
 
-    reject(vec![None; plan.len() - 1], "too few entries");
-    reject(vec![None; plan.len() + 1], "too many entries");
+    reject(vec![None; plan.num_entries() - 1], "too few entries");
+    reject(vec![None; plan.num_entries() + 1], "too many entries");
     // Would otherwise decode to fill values -- what a shard erased between
     // planning and fetching looks like from here.
-    reject(vec![None; plan.len()], "nothing supplied for a read");
+    reject(
+        vec![None; plan.num_entries()],
+        "nothing supplied for a read",
+    );
 
     // Bytes of the wrong length, from the same shard.
     let mut fetched = fetch(&store, &key, &plan)?;
@@ -281,7 +282,7 @@ fn a_plan_from_a_differing_shard_is_rejected() -> Result<(), Box<dyn Error>> {
     let err = other
         .as_planned()
         .expect("sharding can plan")
-        .partial_decode_from_bytes(&plan, vec![None; plan.len()], &options)
+        .partial_decode_from_bytes(&plan, vec![None; plan.num_entries()], &options)
         .expect_err("a plan from another shard must fail");
     assert!(
         matches!(err, CodecError::ReadPlanMismatch),

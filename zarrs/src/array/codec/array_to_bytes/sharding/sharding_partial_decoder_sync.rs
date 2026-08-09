@@ -39,6 +39,13 @@ pub struct ShardingPartialDecoder {
     shard_index: Option<Vec<u64>>,
     #[expect(dead_code)] // TODO: Remove when sharding-specific options are added
     sharding_options: ShardingCodecOptions,
+    /// Whether an inner chunk is itself a shard, resolved once at construction.
+    ///
+    /// Answering it walks the codec chain, and it decides both whether inner decoders
+    /// are worth keeping and whether a selection can be planned -- the latter on every
+    /// planned call. Resolved with the options this decoder was built with, as the
+    /// decoder cache below already was.
+    nested: bool,
     /// Inner-chunk decoders kept across accesses, keyed by shard index entry.
     ///
     /// Building one of these decodes that chunk's own index when the inner
@@ -80,13 +87,16 @@ impl ShardingPartialDecoder {
             inner_codecs,
             shard_index,
             sharding_options,
+            nested: false,
             subchunk_decoders: None,
         };
 
+        // More than one level in the local grid hierarchy means the inner chunk is
+        // itself a shard carrying its own index.
+        decoder.nested = decoder.local_subchunk_grids(options)?.len() > 1;
         // Only worth keeping decoders when building one is expensive, which is
-        // when the inner chunk is itself a shard carrying its own index. More
-        // than one level in the local grid hierarchy is exactly that.
-        if decoder.local_subchunk_grids(options)?.len() > 1 {
+        // exactly then.
+        if decoder.nested {
             decoder.subchunk_decoders = Some(Mutex::new(HashMap::new()));
         }
         Ok(decoder)
@@ -306,9 +316,10 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
     fn read_plan(
         &self,
         indexer: &dyn Indexer,
-        options: &CodecOptions,
+        // Whether a selection can be planned was resolved at construction.
+        _options: &CodecOptions,
     ) -> Result<Option<ReadPlan>, CodecError> {
-        let Some((subset, _)) = self.planned_subset(indexer, options)? else {
+        let Some((subset, _)) = self.planned_subset(indexer) else {
             return Ok(None);
         };
         let planned = plan_subchunk_tasks(
@@ -331,7 +342,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
     ) -> Result<ArrayBytes<'_>, CodecError> {
         // A selection this decoder does not plan -- nested sharding, a variable-size
         // type -- cannot have produced this plan, so something else did.
-        let Some((subset, data_type_size)) = self.planned_subset(plan.subset(), options)? else {
+        let Some((subset, data_type_size)) = self.planned_subset(plan.subset()) else {
             return Err(CodecError::ReadPlanMismatch);
         };
         let planned = plan_subchunk_tasks(
@@ -351,7 +362,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         // length, which is the usual case for uncompressed inner chunks. Order is the
         // caller's side of the contract.
         if fetched.len() != tasks.len()
-            || plan.len() != tasks.len()
+            || plan.num_entries() != tasks.len()
             || izip!(plan.byte_ranges(), &fetched, tasks).any(|(range, bytes, task)| {
                 *range != task.byte_range() || bytes.as_ref().map(Bytes::len) != task.fetched_len()
             })
@@ -390,23 +401,20 @@ impl ShardingPartialDecoder {
     fn planned_subset<'a>(
         &self,
         indexer: &'a dyn Indexer,
-        options: &CodecOptions,
-    ) -> Result<Option<(&'a dyn ArraySubsetTraits, usize)>, CodecError> {
+    ) -> Option<(&'a dyn ArraySubsetTraits, usize)> {
         // Only the fixed-size array subset path decodes one inner chunk per read.
         // Returning the size is what lets the decode path have it without asking
         // again and finding a case this rejected.
         let data_type = self.inner_codecs.data_type();
         let DataTypeSize::Fixed(data_type_size) = data_type.size() else {
-            return Ok(None);
+            return None;
         };
         if data_type.is_optional() {
-            return Ok(None);
+            return None;
         }
-        let Some(subset) = indexer.as_array_subset() else {
-            return Ok(None);
-        };
+        let subset = indexer.as_array_subset()?;
         if subset.dimensionality() != self.shard_shape.len() {
-            return Ok(None);
+            return None;
         }
 
         // A plan describes one level of reads. When an inner chunk is itself
@@ -414,11 +422,11 @@ impl ShardingPartialDecoder {
         // chunk names whole inner shards rather than the bytes actually
         // wanted. Report nothing rather than something misleading; the caller
         // falls back to `partial_decode`, which walks the levels itself.
-        if self.local_subchunk_grids(options)?.len() > 1 {
-            return Ok(None);
+        if self.nested {
+            return None;
         }
 
-        Ok(Some((subset, data_type_size)))
+        Some((subset, data_type_size))
     }
 }
 
