@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use zarrs_chunk_grid::ChunkGridCreateError;
 use zarrs_data_type::{DataType, FillValue};
+use zarrs_storage::byte_range::ByteRange;
 
 use crate::codec_partial_default::ArrayToBytesCodecPartialDefault;
 use crate::{
@@ -28,6 +29,24 @@ pub trait ArrayToBytesCodecSubchunkingTraits: ArrayCodecTraits {
         &self,
         decoded_chunk_grid: ChunkGridDecodedRef<'_>,
     ) -> Result<Vec<ChunkGridDecoded>, ChunkGridCreateError>;
+
+    /// The byte range of the index this codec uses to locate its subchunks, if it has one.
+    ///
+    /// Answered without reading anything, from `decoded_shape` alone: an index of this kind
+    /// has a fixed encoded size and a known place within the encoded chunk. That is what
+    /// makes it plannable -- a caller can be told where a subchunk's index lives before
+    /// anything has been read, including the index of a subchunk nested inside a subchunk.
+    ///
+    /// The range is relative to the encoded chunk this codec produces, so a
+    /// [`Suffix`](ByteRange::Suffix) is relative to that chunk's end rather than the
+    /// stored value's.
+    ///
+    /// [`None`] when the codec has no such index, when its size is not fixed, or when
+    /// `decoded_shape` is not one it supports. Defaulting to [`None`] means a codec opts in.
+    fn subchunk_index_byte_range(&self, decoded_shape: &[NonZeroU64]) -> Option<ByteRange> {
+        _ = decoded_shape;
+        None
+    }
 
     /// Return the outermost decoded subchunk grid created by this codec.
     ///
