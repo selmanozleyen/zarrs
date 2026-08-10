@@ -1,6 +1,6 @@
-//! `ArrayPartialDecoderPlanned::read_plan` / `partial_decode_from_bytes`.
+//! `ArrayPartialDecoderPlanned::read_plan` and the plans it returns.
 //!
-//! The point of the pair is that a caller holding several decoders can collect
+//! The point of planning is that a caller holding several decoders can collect
 //! all of their reads, issue them together, and hand the bytes back. These
 //! tests pin the two properties that makes possible: planning touches no
 //! storage, and decoding from supplied bytes touches no storage either.
@@ -17,9 +17,10 @@ use zarrs::array::codec::array_to_bytes::sharding::{
 };
 use zarrs::array::codec::{Crc32cCodec, GzipCodec};
 use zarrs::array::{
-    Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset,
-    BytesToBytesCodecTraits, CodecError, CodecOptions, PlanStage, ReadPlan,
-    UnboundArrayToBytesCodecTraits, data_type,
+    Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView,
+    ArrayPartialDecoderPlanned, ArrayPartialDecoderTraits, ArraySubset, BytesToBytesCodecTraits,
+    CodecError, CodecOptions, DataPlan, IndexPlan, ReadPlan, UnboundArrayToBytesCodecTraits,
+    data_type,
 };
 use zarrs::storage::byte_range::ByteRange;
 use zarrs::storage::storage_adapter::performance_metrics::PerformanceMetricsStorageAdapter;
@@ -33,21 +34,42 @@ const fn nz(v: u64) -> NonZeroU64 {
     NonZeroU64::new(v).unwrap()
 }
 
-/// Do the plan's reads, in whatever order the caller likes.
+/// Do a plan's reads, in whatever order the caller likes.
 ///
 /// What the store returns goes straight back to the decoder -- no copy, and no
 /// conversion to talk it into the decoder's argument type. Entries with nothing to
-/// read keep their place without being visited, which is what `reads` is for.
+/// read keep their place without being visited.
 fn fetch(
     store: &TestStore,
     key: &StoreKey,
-    plan: &ReadPlan,
+    byte_ranges: &[Option<ByteRange>],
 ) -> Result<Vec<MaybeBytes>, Box<dyn Error>> {
-    let mut fetched = vec![None; plan.num_entries()];
-    for (entry, byte_range) in plan.reads() {
-        fetched[entry] = store.get_partial(key, byte_range)?;
+    let mut fetched = vec![None; byte_ranges.len()];
+    for (entry, byte_range) in byte_ranges.iter().enumerate() {
+        if let Some(byte_range) = byte_range {
+            fetched[entry] = store.get_partial(key, *byte_range)?;
+        }
     }
     Ok(fetched)
+}
+
+/// The decoder as a planning one, which sharding always is.
+fn planned_of(decoder: &Arc<dyn ArrayPartialDecoderTraits>) -> Arc<dyn ArrayPartialDecoderPlanned> {
+    decoder.clone().into_planned().expect("sharding can plan")
+}
+
+fn expect_data(plan: ReadPlan) -> DataPlan {
+    match plan {
+        ReadPlan::Data(plan) => plan,
+        ReadPlan::Indexes(_) => panic!("expected a data plan, got an index plan"),
+    }
+}
+
+fn expect_indexes(plan: ReadPlan) -> IndexPlan {
+    match plan {
+        ReadPlan::Data(_) => panic!("expected an index plan, got a data plan"),
+        ReadPlan::Indexes(plan) => plan,
+    }
 }
 
 /// A `[16, 16]` `uint16` array in `[8, 8]` shards of `[2, 2]` inner chunks.
@@ -97,6 +119,31 @@ fn build_opt(nested: bool, options: ShardingCodecOptions) -> TestArray {
     Ok((array, store))
 }
 
+/// Three levels: an `[8, 8]` shard of `[4, 4]` subchunks, each a shard of
+/// `[2, 2]` inner shards, each holding `[1, 1]` chunks.
+///
+/// One index exchange cannot reach the innermost level of this, so it is what
+/// the too-deep decline is tested against.
+fn build_deep() -> TestArray {
+    let store = Arc::new(PerformanceMetricsStorageAdapter::new(Arc::new(
+        MemoryStore::default(),
+    )));
+    let data_type = data_type::uint16();
+    let innermost = ShardingCodecBuilder::new(vec![nz(1), nz(1)], &data_type).build();
+    let inner = ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type)
+        .array_to_bytes_codec(Arc::new(innermost))
+        .build();
+    let outer = ShardingCodecBuilder::new(vec![nz(4), nz(4)], &data_type)
+        .array_to_bytes_codec(Arc::new(inner))
+        .build();
+    let mut builder = ArrayBuilder::new(vec![16, 16], vec![8, 8], data_type, 0u16);
+    builder.array_to_bytes_codec(Arc::new(outer));
+    let array = builder.build_arc(store.clone(), "/array")?;
+    let data = (0..256u16).collect::<Vec<_>>();
+    array.store_array_subset(&array.subset_all(), &data)?;
+    Ok((array, store))
+}
+
 #[test]
 fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
@@ -107,21 +154,20 @@ fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn
 
     let decoder = array.partial_decoder(&[0, 0])?;
     let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
-    let planned = decoder.as_planned().expect("sharding can plan");
+    let planned = planned_of(&decoder);
 
     let before = store.reads();
     let plan = planned
         .read_plan(&subset, &options)?
         .expect("sharding reports its reads");
     assert_eq!(store.reads(), before, "planning must not perform any reads");
-    assert!(!plan.is_empty());
+    let plan = expect_data(plan);
+    assert!(plan.num_entries() > 0);
 
-    let fetched = fetch(&store, &key, &plan)?;
+    let fetched = fetch(&store, &key, plan.byte_ranges())?;
 
     let before = store.reads();
-    let got = planned
-        .partial_decode_from_bytes(&plan, fetched, &options)?
-        .into_fixed()?;
+    let got = plan.decode(fetched, &options)?.into_fixed()?;
     assert_eq!(
         store.reads(),
         before,
@@ -133,7 +179,7 @@ fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn
 }
 
 /// A shard with no inner chunk present still reports one entry per chunk, so
-/// the plan stays one-to-one with what `partial_decode_from_bytes` expects.
+/// the plan stays one-to-one with what decoding expects.
 #[test]
 fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
@@ -143,29 +189,27 @@ fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     // Chunk [1, 1] was written; erase it so the shard is absent.
     array.erase_chunk(&[1, 1])?;
     let decoder = array.partial_decoder(&[1, 1])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
-    let plan = planned
-        .read_plan(&subset, &options)?
-        .expect("sharding reports its reads");
+    let plan = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
     assert_eq!(
         plan.num_entries(),
         4,
         "one entry per inner chunk in the subset"
     );
     assert_eq!(plan.reads().count(), 0, "but nothing to read");
-    assert!(!plan.is_empty(), "entries without reads are still entries");
 
-    let got = planned
-        .partial_decode_from_bytes(&plan, vec![None; plan.num_entries()], &options)?
+    let got = plan
+        .decode(vec![None; plan.num_entries()], &options)?
         .into_fixed()?;
     assert_eq!(got, vec![0u8; 4 * 4 * 2], "fill value");
 
     Ok(())
 }
 
-/// Nested sharding reports no plan.
-///
-/// A nested selection is never reported as a one-level plan.
+/// A nested selection is never reported as a one-level data plan.
 ///
 /// One range per inner chunk would name whole inner shards rather than the bytes actually
 /// wanted, over-reading by an unbounded factor. The first stage names the inner indexes
@@ -177,13 +221,11 @@ fn nested_sharding_never_plans_whole_inner_shards() -> Result<(), Box<dyn Error>
     let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
     let decoder = array.partial_decoder(&[0, 0])?;
 
-    let planned = decoder.as_planned().expect("sharding can plan");
-    let plan = planned
+    let plan = planned_of(&decoder)
         .read_plan(&subset, &options)?
         .expect("a nested selection is planned, in stages");
-    assert_eq!(
-        plan.stage(),
-        PlanStage::SubchunkIndexes,
+    assert!(
+        matches!(plan, ReadPlan::Indexes(_)),
         "the first stage must not be the data"
     );
 
@@ -234,9 +276,8 @@ fn an_outer_bytes_codec_declines_planning() -> Result<(), Box<dyn Error>> {
         array.store_array_subset(&array.subset_all(), (0..64u16).collect::<Vec<_>>())?;
 
         let decoder = array.partial_decoder(&[0, 0])?;
-        let planned = decoder.as_planned().expect("sharding can plan");
         assert!(
-            planned.read_plan(&subset, &options)?.is_none(),
+            planned_of(&decoder).read_plan(&subset, &options)?.is_none(),
             "{label}: planned offsets that are not offsets into the stored value"
         );
         // Declining costs nothing but the plan: the ordinary path still reads it.
@@ -256,8 +297,7 @@ fn an_outer_bytes_codec_declines_planning() -> Result<(), Box<dyn Error>> {
 /// Nesting changes where bytes live, not what they decode to.
 ///
 /// The outer level still goes through the shared subchunk geometry, so this is
-/// what catches that path being wrong for nested shards specifically -- the
-/// planned tests cannot cover it, because nesting declines to plan.
+/// what catches that path being wrong for nested shards specifically.
 #[test]
 fn nested_sharding_decodes_the_same_values() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
@@ -285,18 +325,18 @@ fn nested_sharding_decodes_the_same_values() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Nesting declines every selection, not just the one the other test uses.
+/// Nesting plans every selection, and never in more than the one exchange the
+/// types allow.
 ///
-/// `as_planned` answers for the decoder and `read_plan` for the selection, so a
-/// nested decoder saying yes to the first and no to the second is the shape the
-/// caller has to handle for every subset it asks about.
+/// `refine` consuming an [`IndexPlan`] and returning a [`DataPlan`] is what
+/// bounds the rounds -- this pins that every subset gets through it.
 #[test]
 fn nested_sharding_plans_every_subset() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (array, store) = build(true)?;
     let key: StoreKey = array.chunk_key(&[0, 0]);
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
+    let planned = planned_of(&decoder);
 
     for ranges in [
         &[0..2, 0..2][..],
@@ -306,28 +346,31 @@ fn nested_sharding_plans_every_subset() -> Result<(), Box<dyn Error>> {
         &[4..8, 4..8][..], // exactly one inner shard
     ] {
         let subset = ArraySubset::new_with_ranges(ranges);
-        let mut plan = planned
+        let plan = planned
+            .clone()
             .read_plan(&subset, &options)?
             .expect("every nested subset is planned");
-        // At most one exchange, and what comes out of it is always the data.
-        let mut rounds = 0;
-        while !plan.is_final() {
-            plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
-            rounds += 1;
-            assert!(rounds <= 1, "{ranges:?} took more than one exchange");
-        }
+        // One exchange at most, which the types state: refine returns a DataPlan.
+        let _data: DataPlan = match plan {
+            ReadPlan::Data(plan) => plan,
+            ReadPlan::Indexes(plan) => {
+                let fetched = fetch(&store, &key, plan.byte_ranges())?;
+                plan.refine(fetched, &options)?
+            }
+        };
     }
 
     Ok(())
 }
 
-/// A plan from a flat array is rejected by a nested decoder, on both entry points.
+/// A hand-built plan pairing this decoder with another layout's ranges is
+/// rejected on both entry points.
 ///
-/// The two arrays have the same shape and shard shape, so the selection is valid
-/// for either. Nothing but the nesting check stands between the caller and inner
-/// shard bytes got as if they were inner chunks.
+/// A plan produced by the API holds the decoder that made it, so it cannot be
+/// paired with another decoder's bytes. Construction is public, though, so the
+/// decoder still checks the ranges against the reads it would perform.
 #[test]
-fn a_flat_plan_is_rejected_by_a_nested_decoder() -> Result<(), Box<dyn Error>> {
+fn a_plan_with_foreign_ranges_is_rejected() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (flat, store) = build(false)?;
     let (nested, _) = build(true)?;
@@ -335,19 +378,24 @@ fn a_flat_plan_is_rejected_by_a_nested_decoder() -> Result<(), Box<dyn Error>> {
     let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
 
     let flat_decoder = flat.partial_decoder(&[0, 0])?;
-    let plan = flat_decoder
-        .as_planned()
-        .expect("sharding can plan")
-        .read_plan(&subset, &options)?
-        .expect("the flat array plans");
-    let fetched = fetch(&store, &key, &plan)?;
+    let flat_plan = expect_data(
+        planned_of(&flat_decoder)
+            .read_plan(&subset, &options)?
+            .expect("the flat array plans"),
+    );
+    let fetched = fetch(&store, &key, flat_plan.byte_ranges())?;
 
+    // The flat array's ranges, hand-paired with the nested array's decoder.
     let nested_decoder = nested.partial_decoder(&[0, 0])?;
-    let nested_planned = nested_decoder.as_planned().expect("sharding can plan");
+    let forged = DataPlan::new(
+        planned_of(&nested_decoder),
+        subset.clone(),
+        flat_plan.byte_ranges().to_vec(),
+    );
 
-    let err = nested_planned
-        .partial_decode_from_bytes(&plan, fetched, &options)
-        .expect_err("a nested decoder must not consume a flat plan");
+    let err = forged
+        .decode(fetched, &options)
+        .expect_err("a nested decoder must not consume a flat plan's ranges");
     assert!(
         matches!(err, CodecError::ReadPlanMismatch),
         "unexpected error: {err}"
@@ -366,10 +414,9 @@ fn a_flat_plan_is_rejected_by_a_nested_decoder() -> Result<(), Box<dyn Error>> {
             ArraySubset::new_with_shape(vec![4, 4]),
         )?
     };
-    let err = nested_planned
-        .partial_decode_from_bytes_into(
-            &plan,
-            fetch(&store, &key, &plan)?,
+    let err = forged
+        .decode_into(
+            fetch(&store, &key, flat_plan.byte_ranges())?,
             ArrayBytesDecodeIntoTarget::Fixed(&mut view),
             &options,
         )
@@ -398,7 +445,7 @@ fn plan_matches_partial_decode_across_subsets() -> Result<(), Box<dyn Error>> {
     let (array, store) = build(false)?;
     let key: StoreKey = array.chunk_key(&[0, 0]);
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
+    let planned = planned_of(&decoder);
 
     for ranges in [
         &[0..2, 0..2][..], // exactly one inner chunk
@@ -408,11 +455,14 @@ fn plan_matches_partial_decode_across_subsets() -> Result<(), Box<dyn Error>> {
         &[0..8, 0..8][..], // the whole shard
     ] {
         let subset = ArraySubset::new_with_ranges(ranges);
-        let plan = planned
-            .read_plan(&subset, &options)?
-            .expect("sharding reports its reads");
-        let got = planned
-            .partial_decode_from_bytes(&plan, fetch(&store, &key, &plan)?, &options)?
+        let plan = expect_data(
+            planned
+                .clone()
+                .read_plan(&subset, &options)?
+                .expect("sharding reports its reads"),
+        );
+        let got = plan
+            .decode(fetch(&store, &key, plan.byte_ranges())?, &options)?
             .into_fixed()?;
         let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
         assert_eq!(got, expected, "subset {ranges:?}");
@@ -423,9 +473,8 @@ fn plan_matches_partial_decode_across_subsets() -> Result<(), Box<dyn Error>> {
 
 /// Bytes that do not match the plan are rejected rather than got.
 ///
-/// The plan carries its own selection, so a plan cannot be paired with a
-/// different one -- but the bytes fetched for it are still the caller's to get
-/// wrong.
+/// The plan carries its own selection and decoder, so neither can be mismatched --
+/// but the bytes fetched for it are still the caller's to get wrong.
 ///
 /// Each of these decodes to plausible-looking data if only the entry count is
 /// checked, so each must be an error instead.
@@ -436,19 +485,18 @@ fn fetched_bytes_must_match_the_plan() -> Result<(), Box<dyn Error>> {
     let key: StoreKey = array.chunk_key(&[0, 0]);
     let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
-    let plan = planned
-        .read_plan(&subset, &options)?
-        .expect("sharding reports its reads");
+    let plan = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
     assert!(
         plan.byte_ranges().iter().all(Option::is_some),
         "every inner chunk of this subset was written"
     );
 
     let reject = |fetched, what| {
-        let err = planned
-            .partial_decode_from_bytes(&plan, fetched, &options)
-            .expect_err(what);
+        let err = plan.decode(fetched, &options).expect_err(what);
         assert!(
             matches!(err, CodecError::ReadPlanMismatch),
             "{what}: unexpected error: {err}"
@@ -465,7 +513,7 @@ fn fetched_bytes_must_match_the_plan() -> Result<(), Box<dyn Error>> {
     );
 
     // Bytes of the wrong length, from the same shard.
-    let mut fetched = fetch(&store, &key, &plan)?;
+    let mut fetched = fetch(&store, &key, plan.byte_ranges())?;
     let short = fetched[0].as_ref().expect("chunk was written").slice(1..);
     fetched[0] = Some(short);
     reject(fetched, "bytes of the wrong length");
@@ -473,8 +521,8 @@ fn fetched_bytes_must_match_the_plan() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `partial_decode_from_bytes_into` writes into the caller's view, at the view's
-/// own origin rather than at the shard's.
+/// `decode_into` writes into the caller's view, at the view's own origin rather
+/// than at the shard's.
 ///
 /// The offset is the whole point: a caller assembling one array from several
 /// decoders gives each a different corner of it, and a decoder that ignored the
@@ -486,13 +534,15 @@ fn decode_from_bytes_into_an_offset_view() -> Result<(), Box<dyn Error>> {
     let key: StoreKey = array.chunk_key(&[0, 0]);
     let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
-    let plan = planned
-        .read_plan(&subset, &options)?
-        .expect("sharding reports its reads");
-    let expected = planned
-        .partial_decode_from_bytes(&plan, fetch(&store, &key, &plan)?, &options)?
-        .into_fixed()?;
+    let plan = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
+    let expected = plan
+        .decode(fetch(&store, &key, plan.byte_ranges())?, &options)?
+        .into_fixed()?
+        .into_owned();
 
     // An [8, 8] output with the 4x4 result dropped at [3, 2], prefilled with a
     // sentinel so anything written outside the target subset shows up.
@@ -509,9 +559,8 @@ fn decode_from_bytes_into_an_offset_view() -> Result<(), Box<dyn Error>> {
                 ArraySubset::new_with_ranges(&[3..7, 2..6]),
             )?
         };
-        planned.partial_decode_from_bytes_into(
-            &plan,
-            fetch(&store, &key, &plan)?,
+        plan.decode_into(
+            fetch(&store, &key, plan.byte_ranges())?,
             ArrayBytesDecodeIntoTarget::Fixed(&mut view),
             &options,
         )?;
@@ -527,79 +576,78 @@ fn decode_from_bytes_into_an_offset_view() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// A plan from a *different array* with the same layout is still rejected.
+/// A plan decodes with the decoder it holds, so two same-layout arrays cannot be
+/// crossed by the API's own flow.
 ///
-/// This is the case comparing byte ranges cannot catch: two arrays written the
-/// same way hold their inner chunks at the same offsets, so both plans are the
-/// same list of ranges. Only the identity of the decoder that produced the plan
-/// tells them apart -- without it, one array's bytes decode as the other's and
-/// are returned as correct.
+/// Two arrays written in the same order hold their inner chunks at the same
+/// offsets, so their plans are byte-identical lists of ranges -- the case no
+/// range comparison can catch. What prevents one array's bytes decoding as the
+/// other's is that a plan is bound to its decoder at construction and every
+/// decode goes through it.
 #[test]
-fn a_plan_from_another_array_is_rejected() -> Result<(), Box<dyn Error>> {
+fn a_plan_decodes_with_the_decoder_it_holds() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (array_a, store_a) = build_ordered()?;
     let (array_b, _) = build_ordered()?;
     let subset = ArraySubset::new_with_ranges(&[0..4, 0..4]);
 
     let decoder_a = array_a.partial_decoder(&[0, 0])?;
-    let plan_a = decoder_a
-        .as_planned()
-        .expect("sharding can plan")
-        .read_plan(&subset, &options)?
-        .expect("sharding reports its reads");
+    let plan_a = expect_data(
+        planned_of(&decoder_a)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
     let decoder_b = array_b.partial_decoder(&[0, 0])?;
-    let plan_b = decoder_b
-        .as_planned()
-        .expect("sharding can plan")
-        .read_plan(&subset, &options)?
-        .expect("sharding reports its reads");
+    let plan_b = expect_data(
+        planned_of(&decoder_b)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
     assert_eq!(
         plan_a.byte_ranges(),
         plan_b.byte_ranges(),
         "same layout, so the ranges alone cannot tell the two arrays apart"
     );
 
-    // Bytes really fetched from A, handed to B's decoder.
-    let fetched = fetch(&store_a, &array_a.chunk_key(&[0, 0]), &plan_a)?;
-    let err = decoder_b
-        .as_planned()
-        .expect("sharding can plan")
-        .partial_decode_from_bytes(&plan_a, fetched, &options)
-        .expect_err("another array's plan must not be accepted");
-    assert!(
-        matches!(err, CodecError::ReadPlanMismatch),
-        "unexpected error: {err}"
-    );
+    // Decoding through plan_a can only ever use array A's decoder.
+    let got = plan_a
+        .decode(
+            fetch(&store_a, &array_a.chunk_key(&[0, 0]), plan_a.byte_ranges())?,
+            &options,
+        )?
+        .into_fixed()?;
+    let want = decoder_a.partial_decode(&subset, &options)?.into_fixed()?;
+    assert_eq!(got, want);
 
     Ok(())
 }
 
-/// A plan from a shard whose index differs is rejected.
+/// A hand-built plan whose ranges are not this decoder's reads is rejected.
 ///
-/// The check compares byte ranges, and shard index offsets are shard-relative, so
-/// two shards with equally sized inner chunks produce identical plans and this
-/// cannot fire. Erasing a shard is what makes the indexes differ. Pairing a plan
-/// with the right shard is the caller's side of the contract.
+/// An erased shard's plan has nothing to read, so its ranges cannot match a
+/// stored shard's -- pairing them by hand must fail rather than decode to fill.
 #[test]
-fn a_plan_from_a_differing_shard_is_rejected() -> Result<(), Box<dyn Error>> {
+fn a_hand_built_plan_with_wrong_ranges_is_rejected() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (array, _) = build(false)?;
     let subset = ArraySubset::new_with_ranges(&[0..4, 0..4]);
 
     array.erase_chunk(&[1, 1])?;
-    let plan = array
-        .partial_decoder(&[1, 1])?
-        .as_planned()
-        .expect("sharding can plan")
-        .read_plan(&subset, &options)?
-        .expect("sharding reports its reads");
+    let erased_plan = expect_data(
+        planned_of(&array.partial_decoder(&[1, 1])?)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
 
     let other = array.partial_decoder(&[0, 0])?;
-    let err = other
-        .as_planned()
-        .expect("sharding can plan")
-        .partial_decode_from_bytes(&plan, vec![None; plan.num_entries()], &options)
-        .expect_err("a plan from another shard must fail");
+    let forged = DataPlan::new(
+        planned_of(&other),
+        subset,
+        erased_plan.byte_ranges().to_vec(),
+    );
+    let err = forged
+        .decode(vec![None; forged.num_entries()], &options)
+        .expect_err("ranges from another shard's index must fail");
     assert!(
         matches!(err, CodecError::ReadPlanMismatch),
         "unexpected error: {err}"
@@ -625,9 +673,10 @@ fn an_out_of_bounds_selection_errors() -> Result<(), Box<dyn Error>> {
             array.erase_chunk(chunk_indices)?;
         }
         let decoder = array.partial_decoder(chunk_indices)?;
-        let planned = decoder.as_planned().expect("sharding can plan");
+        let planned = planned_of(&decoder);
 
         let err = planned
+            .clone()
             .read_plan(&oob, &options)
             .expect_err("planning an out-of-bounds subset must fail");
         assert!(
@@ -636,12 +685,8 @@ fn an_out_of_bounds_selection_errors() -> Result<(), Box<dyn Error>> {
         );
 
         // The same selection reaching the decode path as a hand-built plan.
-        let err = planned
-            .partial_decode_from_bytes(
-                &ReadPlan::new(oob.clone(), Vec::new(), 0),
-                Vec::new(),
-                &options,
-            )
+        let err = DataPlan::new(planned, oob.clone(), Vec::new())
+            .decode(Vec::new(), &options)
             .expect_err("decoding an out-of-bounds plan must fail");
         assert!(
             matches!(err, CodecError::IncompatibleIndexer(_)),
@@ -664,21 +709,20 @@ fn a_nested_plan_names_the_subchunk_indexes_first() -> Result<(), Box<dyn Error>
     let subset = ArraySubset::new_with_ranges(&[0..3, 0..3]);
 
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
 
     let before = store.reads();
-    let plan = planned
+    let plan = planned_of(&decoder)
         .read_plan(&subset, &options)?
         .expect("a nested selection is planned");
     assert_eq!(store.reads(), before, "planning must not perform any reads");
-    assert_eq!(plan.stage(), PlanStage::SubchunkIndexes);
-    assert!(!plan.is_final(), "the indexes are not the data");
+    let index_plan = expect_indexes(plan);
+    let index_entries = index_plan.num_entries();
+    let index_reads = index_plan.reads().count();
 
-    let fetched = fetch(&store, &key, &plan)?;
-    let data_plan = planned.refine_read_plan(&plan, fetched, &options)?;
-    assert!(data_plan.is_final(), "refining gives the data plan");
-    assert_eq!(store.reads(), before + plan.reads().count());
-    assert!(data_plan.num_entries() >= plan.num_entries());
+    let fetched = fetch(&store, &key, index_plan.byte_ranges())?;
+    let data_plan = index_plan.refine(fetched, &options)?;
+    assert_eq!(store.reads(), before + index_reads);
+    assert!(data_plan.num_entries() >= index_entries);
 
     Ok(())
 }
@@ -697,11 +741,13 @@ fn a_nested_plan_reads_less_than_the_subchunks_holding_it() -> Result<(), Box<dy
     let subset = ArraySubset::new_with_ranges(&[0..6, 0..6]);
 
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
-    let plan = planned
-        .read_plan(&subset, &options)?
-        .expect("a nested selection is planned");
-    let data_plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
+    let index_plan = expect_indexes(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("a nested selection is planned"),
+    );
+    let fetched = fetch(&store, &key, index_plan.byte_ranges())?;
+    let data_plan = index_plan.refine(fetched, &options)?;
 
     let planned_bytes: u64 = data_plan
         .reads()
@@ -731,37 +777,32 @@ fn refining_rejects_bytes_that_are_not_the_indexes() -> Result<(), Box<dyn Error
     let subset = ArraySubset::new_with_ranges(&[0..2, 0..2]);
 
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
-    let plan = planned
-        .read_plan(&subset, &options)?
-        .expect("a nested selection is planned");
+    let planned = planned_of(&decoder);
+    let plan = expect_indexes(
+        planned
+            .clone()
+            .read_plan(&subset, &options)?
+            .expect("a nested selection is planned"),
+    );
 
     // Right count, wrong lengths.
     let short = vec![Some(Bytes::from_static(b"xy")); plan.num_entries()];
-    let err = planned
-        .refine_read_plan(&plan, short, &options)
+    let err = plan
+        .refine(short, &options)
         .expect_err("bytes of the wrong length are not the indexes");
     assert!(
         matches!(err, CodecError::ReadPlanMismatch),
         "unexpected: {err}"
     );
 
-    // A final plan has nothing to refine.
-    let (flat_array, flat_store) = build(false)?;
-    let flat_key: StoreKey = flat_array.chunk_key(&[0, 0]);
+    // An index plan a flat decoder would never have produced. Its own plans are
+    // all data plans, so refining is not something it can be asked to do.
+    let (flat_array, _) = build(false)?;
     let flat_decoder = flat_array.partial_decoder(&[0, 0])?;
-    let flat_planned = flat_decoder.as_planned().expect("sharding can plan");
-    let flat_plan = flat_planned
-        .read_plan(&subset, &options)?
-        .expect("a flat selection is planned");
-    assert!(flat_plan.is_final(), "a flat plan needs no stages");
-    let err = flat_planned
-        .refine_read_plan(
-            &flat_plan,
-            fetch(&flat_store, &flat_key, &flat_plan)?,
-            &options,
-        )
-        .expect_err("a final plan cannot be refined");
+    let forged = IndexPlan::new(planned_of(&flat_decoder), subset, Vec::new());
+    let err = forged
+        .refine(Vec::new(), &options)
+        .expect_err("a flat decoder has no index plans to refine");
     assert!(
         matches!(err, CodecError::ReadPlanMismatch),
         "unexpected: {err}"
@@ -780,7 +821,7 @@ fn a_nested_plan_decodes_to_the_same_bytes() -> Result<(), Box<dyn Error>> {
     let (array, store) = build(true)?;
     let key: StoreKey = array.chunk_key(&[0, 0]);
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
+    let planned = planned_of(&decoder);
 
     for ranges in [
         &[0..2, 0..2][..], // one innermost chunk
@@ -795,18 +836,20 @@ fn a_nested_plan_decodes_to_the_same_bytes() -> Result<(), Box<dyn Error>> {
         let subset = ArraySubset::new_with_ranges(ranges);
         let want = decoder.partial_decode(&subset, &options)?.into_fixed()?;
 
-        let mut data_plan = planned
+        let data_plan = match planned
+            .clone()
             .read_plan(&subset, &options)?
-            .expect("a nested selection is planned");
-        while !data_plan.is_final() {
-            data_plan =
-                planned.refine_read_plan(&data_plan, fetch(&store, &key, &data_plan)?, &options)?;
-        }
-        let fetched = fetch(&store, &key, &data_plan)?;
+            .expect("a nested selection is planned")
+        {
+            ReadPlan::Data(plan) => plan,
+            ReadPlan::Indexes(plan) => {
+                let fetched = fetch(&store, &key, plan.byte_ranges())?;
+                plan.refine(fetched, &options)?
+            }
+        };
+        let fetched = fetch(&store, &key, data_plan.byte_ranges())?;
         let before = store.reads();
-        let got = planned
-            .partial_decode_from_bytes(&data_plan, fetched, &options)?
-            .into_fixed()?;
+        let got = data_plan.decode(fetched, &options)?.into_fixed()?;
         assert_eq!(
             store.reads(),
             before,
@@ -829,7 +872,7 @@ fn wanting_whole_subchunks_needs_no_index_round() -> Result<(), Box<dyn Error>> 
     let (array, store) = build(true)?;
     let key: StoreKey = array.chunk_key(&[0, 0]);
     let decoder = array.partial_decoder(&[0, 0])?;
-    let planned = decoder.as_planned().expect("sharding can plan");
+    let planned = planned_of(&decoder);
 
     for ranges in [
         &[0..8, 0..8][..], // the whole shard: four whole subchunks
@@ -838,27 +881,79 @@ fn wanting_whole_subchunks_needs_no_index_round() -> Result<(), Box<dyn Error>> 
     ] {
         let subset = ArraySubset::new_with_ranges(ranges);
         let plan = planned
+            .clone()
             .read_plan(&subset, &options)?
             .expect("planned in one go");
-        assert!(
-            plan.is_final(),
-            "{ranges:?} wants whole subchunks, so it needs no index round"
-        );
+        let ReadPlan::Data(plan) = plan else {
+            panic!("{ranges:?} wants whole subchunks, so it needs no index round");
+        };
         let want = decoder.partial_decode(&subset, &options)?.into_fixed()?;
-        let got = planned
-            .partial_decode_from_bytes(&plan, fetch(&store, &key, &plan)?, &options)?
+        let got = plan
+            .decode(fetch(&store, &key, plan.byte_ranges())?, &options)?
             .into_fixed()?;
         assert_eq!(got, want, "subset {ranges:?}");
     }
 
     // And one that wants part of a subchunk still stages.
     assert!(
-        !planned
-            .read_plan(&ArraySubset::new_with_ranges(&[0..3, 0..3]), &options)?
-            .expect("planned")
-            .is_final(),
+        matches!(
+            planned
+                .clone()
+                .read_plan(&ArraySubset::new_with_ranges(&[0..3, 0..3]), &options)?
+                .expect("planned"),
+            ReadPlan::Indexes(_)
+        ),
         "part of a subchunk needs its index"
     );
+
+    Ok(())
+}
+
+/// Nesting deeper than one exchange declines part-wanted selections instead of
+/// planning them badly.
+///
+/// One index round cannot reach the innermost level of a three-level shard. A
+/// data plan at the subchunk level would name whole nested shards -- reading far
+/// more than was asked, with nothing for the caller to notice -- so the only
+/// honest answers are a whole-subchunk plan when that is what was asked, and no
+/// plan at all otherwise.
+#[test]
+fn too_deep_nesting_declines_part_wanted_selections() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build_deep()?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = planned_of(&decoder);
+
+    // Wants part of a subchunk: cannot be read minimally, so it is not planned.
+    for ranges in [
+        &[1..3, 1..3][..], // inside one subchunk
+        &[2..6, 1..5][..], // straddling subchunks, all in part
+        &[0..4, 0..6][..], // one whole subchunk, one in part
+    ] {
+        let subset = ArraySubset::new_with_ranges(ranges);
+        assert!(
+            planned.clone().read_plan(&subset, &options)?.is_none(),
+            "{ranges:?} wants part of a too-deep subchunk and must be declined"
+        );
+        // Declining costs nothing but the plan.
+        let got = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+        assert!(!got.is_empty(), "{ranges:?}: ordinary path still decodes");
+    }
+
+    // Whole subchunks are their extents in the outer index: still plannable.
+    let subset = ArraySubset::new_with_ranges(&[0..4, 0..4]);
+    let plan = expect_data(
+        planned
+            .clone()
+            .read_plan(&subset, &options)?
+            .expect("a whole subchunk needs no index round at any depth"),
+    );
+    let want = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+    let got = plan
+        .decode(fetch(&store, &key, plan.byte_ranges())?, &options)?
+        .into_fixed()?;
+    assert_eq!(got, want);
 
     Ok(())
 }

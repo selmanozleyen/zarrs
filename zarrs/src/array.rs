@@ -70,9 +70,9 @@ pub use zarrs_codec::{
     ArrayToBytesCodecTraits, BytesPartialDecoderTraits, BytesPartialEncoderTraits,
     BytesRepresentation, BytesToBytesCodecTraits, ChunkGridDecoded, ChunkGridDecodedRef, Codec,
     CodecCreateError, CodecError, CodecMetadataOptions, CodecOptions, CodecSpecificOptions,
-    CodecTraits, CodecTraitsV2, CodecTraitsV3, PlanStage, ReadPlan, RecommendedConcurrency,
-    UnboundArrayToArrayCodecTraits, UnboundArrayToBytesCodecTraits, copy_fill_value_into,
-    update_array_bytes,
+    CodecTraits, CodecTraitsV2, CodecTraitsV3, DataPlan, IndexPlan, ReadPlan,
+    RecommendedConcurrency, UnboundArrayToArrayCodecTraits, UnboundArrayToBytesCodecTraits,
+    copy_fill_value_into, update_array_bytes,
 };
 #[cfg(feature = "async")]
 pub use zarrs_codec::{
