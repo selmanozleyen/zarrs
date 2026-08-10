@@ -12,7 +12,9 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use unsafe_cell_slice::UnsafeCellSlice;
-use zarrs::array::codec::array_to_bytes::sharding::ShardingCodecBuilder;
+use zarrs::array::codec::array_to_bytes::sharding::{
+    ShardingCodecBuilder, ShardingCodecOptions, SubchunkWriteOrder,
+};
 use zarrs::array::codec::{Crc32cCodec, GzipCodec};
 use zarrs::array::{
     Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset,
@@ -52,6 +54,21 @@ fn fetch(
 /// With `nested`, the shard instead holds `[4, 4]` inner chunks that are
 /// themselves shards of `[2, 2]` chunks.
 fn build(nested: bool) -> TestArray {
+    build_opt(nested, ShardingCodecOptions::default())
+}
+
+/// Two arrays only hold their subchunks at the same offsets if both were written
+/// in the same order, and the default order is deliberately not one. A test whose
+/// premise is "same layout, same ranges" has to pin the order down or it is a test
+/// of how the threads were scheduled.
+fn build_ordered() -> TestArray {
+    build_opt(
+        false,
+        ShardingCodecOptions::default().with_subchunk_write_order(SubchunkWriteOrder::C),
+    )
+}
+
+fn build_opt(nested: bool, options: ShardingCodecOptions) -> TestArray {
     let store = Arc::new(PerformanceMetricsStorageAdapter::new(Arc::new(
         MemoryStore::default(),
     )));
@@ -61,10 +78,15 @@ fn build(nested: bool) -> TestArray {
         Arc::new(
             ShardingCodecBuilder::new(vec![nz(4), nz(4)], &data_type)
                 .array_to_bytes_codec(Arc::new(inner))
-                .build(),
+                .build()
+                .with_options(options),
         )
     } else {
-        Arc::new(ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type).build())
+        Arc::new(
+            ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type)
+                .build()
+                .with_options(options),
+        )
     };
     let mut builder = ArrayBuilder::new(vec![16, 16], vec![8, 8], data_type, 0u16);
     builder.array_to_bytes_codec(codec);
@@ -505,8 +527,8 @@ fn decode_from_bytes_into_an_offset_view() -> Result<(), Box<dyn Error>> {
 #[test]
 fn a_plan_from_another_array_is_rejected() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
-    let (array_a, store_a) = build(false)?;
-    let (array_b, _) = build(false)?;
+    let (array_a, store_a) = build_ordered()?;
+    let (array_b, _) = build_ordered()?;
     let subset = ArraySubset::new_with_ranges(&[0..4, 0..4]);
 
     let decoder_a = array_a.partial_decoder(&[0, 0])?;
