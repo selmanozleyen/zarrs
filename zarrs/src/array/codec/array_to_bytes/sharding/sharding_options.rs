@@ -31,7 +31,7 @@ impl Default for ShardingCodecOptions {
     fn default() -> Self {
         Self {
             subchunk_write_order: SubchunkWriteOrder::Unordered,
-            subchunk_decoder_cache: true,
+            subchunk_decoder_cache: false,
         }
     }
 }
@@ -60,7 +60,7 @@ impl ShardingCodecOptions {
     }
 
     /// Keep inner-chunk partial decoders for the lifetime of a shard's partial
-    /// decoder. Enabled by default.
+    /// decoder. Disabled by default.
     ///
     /// Only has an effect when inner chunks are themselves shards. Building such
     /// a decoder reads and decodes that inner shard's own index, so without this
@@ -68,8 +68,10 @@ impl ShardingCodecOptions {
     /// inner shard. Where inner chunks are not shards, construction is cheap and
     /// no decoders are kept regardless of this setting.
     ///
-    /// The decoders hold a shard index that a concurrent write would invalidate,
-    /// which is the reason it can be turned off.
+    /// Off by default because the decoders hold a shard index that a concurrent
+    /// write would invalidate, and because they are held for as long as the shard's
+    /// decoder is, with no bound on how many. A reader that keeps decoders around
+    /// and does not write is the case this is for.
     #[must_use]
     pub fn with_subchunk_decoder_cache(mut self, subchunk_decoder_cache: bool) -> Self {
         self.subchunk_decoder_cache = subchunk_decoder_cache;

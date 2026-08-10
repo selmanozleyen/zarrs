@@ -38,6 +38,15 @@ fn build(nested: bool) -> TestArray {
     build_opt(nested, ShardingCodecOptions::default())
 }
 
+/// The subchunk decoder cache is off by default, so a test about what it saves
+/// has to ask for it.
+fn build_cached(nested: bool) -> TestArray {
+    build_opt(
+        nested,
+        ShardingCodecOptions::default().with_subchunk_decoder_cache(true),
+    )
+}
+
 fn build_opt(nested: bool, options: ShardingCodecOptions) -> TestArray {
     let store = Arc::new(PerformanceMetricsStorageAdapter::new(Arc::new(
         MemoryStore::default(),
@@ -161,7 +170,7 @@ fn nested_sharding_reads_one_index_per_level() -> Result<(), Box<dyn Error>> {
 #[test]
 fn nested_sharding_reads_each_inner_index_once() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
-    let (array, store) = build(true)?;
+    let (array, store) = build_cached(true)?;
     let decoder = array.partial_decoder(&[0, 0])?;
 
     // Both subsets live in inner shard [0, 0], in different innermost chunks.
@@ -182,7 +191,7 @@ fn nested_sharding_reads_each_inner_index_once() -> Result<(), Box<dyn Error>> {
 
     // Across the whole shard: visiting all four inner shards twice costs four
     // index reads, not eight. Without keeping the decoders this would be eight.
-    let (array, store) = build(true)?;
+    let (array, store) = build_cached(true)?;
     let decoder = array.partial_decoder(&[0, 0])?;
     let before = store.reads();
     for pass in 0..2u64 {
@@ -226,7 +235,10 @@ fn subchunk_decoder_cache_can_be_turned_off() -> Result<(), Box<dyn Error>> {
         counts.push(store.reads() - before);
     }
 
-    println!("cache on: {} reads, cache off: {} reads", counts[0], counts[1]);
+    println!(
+        "cache on: {} reads, cache off: {} reads",
+        counts[0], counts[1]
+    );
     assert!(
         counts[1] > counts[0],
         "with the cache off the inner index is read again: {} against {}",
