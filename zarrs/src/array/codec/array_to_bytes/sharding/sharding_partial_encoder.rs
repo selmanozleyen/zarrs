@@ -128,6 +128,9 @@ impl ArrayPartialDecoderTraits for ShardingPartialEncoder {
             &self.shard_shape,
             &self.subchunk_shape,
             &self.inner_codecs,
+            // The encoder's shard index changes as it writes, so a decoder
+            // built against one state must not be reused against another.
+            None,
             Some(self.shard_index.lock().unwrap().as_slice()),
             indexer,
             options,
