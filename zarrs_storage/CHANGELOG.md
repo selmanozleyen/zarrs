@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/zarrs/zarrs/compare/zarrs_storage-v0.4.5...HEAD)
 
+### Added
+- Add `byte_range::extract_byte_ranges_ref`, a copy-free variant of `extract_byte_ranges` returning slices
+
 ### Fixed
 - Count async erase operations in `PerformanceMetricsStorageAdapter`
 - Make sync and async `UsageLogStorageAdapter` output consistent and fix malformed sync `erase_many` log messages
