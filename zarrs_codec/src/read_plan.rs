@@ -16,13 +16,15 @@ use zarrs_storage::byte_range::ByteRange;
 /// itself guarantees is only that a plan cannot be paired with a *selection* other than
 /// its own; everything else is checked by the decoder when the plan comes back.
 ///
-/// One entry per subchunk of the decoder's level-zero subchunk grid, in the order the
-/// bytes must be handed back. A [`None`] entry marks a subchunk with nothing to read,
-/// which decodes to the fill value. Entries are never omitted, because their positions
-/// are the only thing tying the plan to the bytes returned for it.
+/// One entry per subchunk the selection touches, in the order the bytes must be handed
+/// back. A [`None`] entry marks a subchunk with nothing to read, which decodes to the fill
+/// value. Entries are never omitted, because their positions are the only thing tying the
+/// plan to the bytes returned for it.
 ///
-/// Level zero only: subchunks nested inside subchunks are not planned, since a range per
-/// level-zero subchunk would name a whole nested shard rather than the bytes wanted.
+/// Where subchunks are themselves subchunked, a plan reaches the innermost level rather
+/// than naming whole nested subchunks -- which would read far more than was asked for. That
+/// takes two rounds, since the nested indexes have to be read before the data they locate
+/// can be named: see [`PlanStage`] and [`is_final`](Self::is_final).
 ///
 /// The selection is an [`ArraySubset`] rather than an
 /// [`Indexer`](zarrs_chunk_grid::Indexer) because only subsets are planned today.
@@ -31,6 +33,28 @@ pub struct ReadPlan {
     subset: ArraySubset,
     byte_ranges: Vec<Option<ByteRange>>,
     source: u64,
+    stage: PlanStage,
+}
+
+/// What a [`ReadPlan`]'s reads are for.
+///
+/// Locating some data takes a read of its own: a subchunk nested inside a subchunk has its
+/// own index, and where that index lives is computable but what it says is not. So a plan
+/// may name those indexes instead of the data, and be exchanged for the data plan once they
+/// have been fetched.
+///
+/// The staging is what keeps the reads batchable. The alternative is discovering each
+/// nested index when its subchunk is first touched, which serialises exactly the reads a
+/// plan exists to issue together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStage {
+    /// Encoded array data. Hand the bytes to
+    /// [`partial_decode_from_bytes`](crate::ArrayPartialDecoderPlanned::partial_decode_from_bytes).
+    Data,
+    /// Subchunk indexes. Hand the bytes to
+    /// [`refine_read_plan`](crate::ArrayPartialDecoderPlanned::refine_read_plan), which
+    /// returns the plan for the data they locate.
+    SubchunkIndexes,
 }
 
 impl ReadPlan {
@@ -55,7 +79,43 @@ impl ReadPlan {
             subset,
             byte_ranges,
             source,
+            stage: PlanStage::Data,
         }
+    }
+
+    /// Create a plan whose reads are subchunk indexes rather than data.
+    ///
+    /// For a decoder whose subchunks are themselves subchunked: the reads locate each
+    /// touched subchunk's own index, and
+    /// [`refine_read_plan`](crate::ArrayPartialDecoderPlanned::refine_read_plan) turns
+    /// those bytes into the plan for the data.
+    #[must_use]
+    pub const fn new_subchunk_indexes(
+        subset: ArraySubset,
+        byte_ranges: Vec<Option<ByteRange>>,
+        source: u64,
+    ) -> Self {
+        Self {
+            subset,
+            byte_ranges,
+            source,
+            stage: PlanStage::SubchunkIndexes,
+        }
+    }
+
+    /// What this plan's reads are for.
+    #[must_use]
+    pub const fn stage(&self) -> PlanStage {
+        self.stage
+    }
+
+    /// Whether the fetched bytes can go straight to `partial_decode_from_bytes`.
+    ///
+    /// [`false`] means one more round: fetch, then
+    /// [`refine_read_plan`](crate::ArrayPartialDecoderPlanned::refine_read_plan).
+    #[must_use]
+    pub const fn is_final(&self) -> bool {
+        matches!(self.stage, PlanStage::Data)
     }
 
     /// The state the byte ranges were computed from, as the producing decoder reported it.

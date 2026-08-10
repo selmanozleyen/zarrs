@@ -321,6 +321,26 @@ impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for ShardingCodecBound {
         super::get_index_byte_range(&index_shape, &self.index_codecs, self.index_location).ok()
     }
 
+    fn decode_subchunk_index(
+        &self,
+        decoded_shape: &[NonZeroU64],
+        encoded: &[u8],
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<u64>>, CodecError> {
+        let chunks_per_shard =
+            super::calculate_chunks_per_shard(decoded_shape, &self.subchunk_shape)?;
+        let index_shape = super::sharding_index_shape(&chunks_per_shard);
+        super::decode_shard_index(encoded, &index_shape, &self.index_codecs, options).map(Some)
+    }
+
+    fn subchunk_shape(&self) -> Option<&[NonZeroU64]> {
+        Some(&self.subchunk_shape)
+    }
+
+    fn subchunk_codecs(&self) -> Option<Arc<dyn zarrs_codec::ArrayToBytesCodecTraits>> {
+        Some(self.inner_codecs.clone())
+    }
+
     fn decoded_subchunk_grids(
         &self,
         decoded_chunk_grid: ChunkGridDecodedRef<'_>,

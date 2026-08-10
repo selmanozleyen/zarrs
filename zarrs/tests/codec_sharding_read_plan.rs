@@ -18,12 +18,13 @@ use zarrs::array::codec::array_to_bytes::sharding::{
 use zarrs::array::codec::{Crc32cCodec, GzipCodec};
 use zarrs::array::{
     Array, ArrayBuilder, ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, ArraySubset,
-    BytesToBytesCodecTraits, CodecError, CodecOptions, ReadPlan, UnboundArrayToBytesCodecTraits,
-    data_type,
+    BytesToBytesCodecTraits, CodecError, CodecOptions, PlanStage, ReadPlan,
+    UnboundArrayToBytesCodecTraits, data_type,
 };
+use zarrs::storage::byte_range::ByteRange;
 use zarrs::storage::storage_adapter::performance_metrics::PerformanceMetricsStorageAdapter;
 use zarrs::storage::store::MemoryStore;
-use zarrs::storage::{MaybeBytes, ReadableStorageTraits, StoreKey};
+use zarrs::storage::{Bytes, MaybeBytes, ReadableStorageTraits, StoreKey};
 
 type TestStore = PerformanceMetricsStorageAdapter<MemoryStore>;
 type TestArray = Result<(Arc<Array<TestStore>>, Arc<TestStore>), Box<dyn Error>>;
@@ -164,27 +165,29 @@ fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
 
 /// Nested sharding reports no plan.
 ///
-/// One range per inner chunk would name whole inner shards rather than the
-/// bytes actually wanted. Rather than hand back a plan that over-reads by an
-/// unbounded factor, report nothing and let the caller use `partial_decode`,
-/// which walks the index levels itself.
+/// A nested selection is never reported as a one-level plan.
+///
+/// One range per inner chunk would name whole inner shards rather than the bytes actually
+/// wanted, over-reading by an unbounded factor. The first stage names the inner indexes
+/// instead, and only the plan that comes back from refining is the data.
 #[test]
-fn nested_sharding_reports_no_plan() -> Result<(), Box<dyn Error>> {
+fn nested_sharding_never_plans_whole_inner_shards() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (array, _) = build(true)?;
     let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
     let decoder = array.partial_decoder(&[0, 0])?;
 
-    // `as_planned` is about the decoder, not the selection: sharding plans
-    // some indexers, so it answers yes and `read_plan` declines this one.
     let planned = decoder.as_planned().expect("sharding can plan");
-    assert!(
-        planned.read_plan(&subset, &options)?.is_none(),
-        "nested sharding must not report a one-level plan"
+    let plan = planned
+        .read_plan(&subset, &options)?
+        .expect("a nested selection is planned, in stages");
+    assert_eq!(
+        plan.stage(),
+        PlanStage::SubchunkIndexes,
+        "the first stage must not be the data"
     );
 
-    // With no plan there is nothing to hand to `partial_decode_from_bytes`, so
-    // the caller takes the ordinary path.
+    // The ordinary path is unaffected by any of this.
     assert!(
         !decoder
             .partial_decode(&subset, &options)?
@@ -288,9 +291,10 @@ fn nested_sharding_decodes_the_same_values() -> Result<(), Box<dyn Error>> {
 /// nested decoder saying yes to the first and no to the second is the shape the
 /// caller has to handle for every subset it asks about.
 #[test]
-fn nested_sharding_declines_every_subset() -> Result<(), Box<dyn Error>> {
+fn nested_sharding_stages_every_subset() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
-    let (array, _) = build(true)?;
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
     let decoder = array.partial_decoder(&[0, 0])?;
     let planned = decoder.as_planned().expect("sharding can plan");
 
@@ -302,10 +306,15 @@ fn nested_sharding_declines_every_subset() -> Result<(), Box<dyn Error>> {
         &[4..8, 4..8][..], // exactly one inner shard
     ] {
         let subset = ArraySubset::new_with_ranges(ranges);
+        let plan = planned
+            .read_plan(&subset, &options)?
+            .expect("every nested subset is planned");
         assert!(
-            planned.read_plan(&subset, &options)?.is_none(),
-            "planned {ranges:?}, which would name whole inner shards"
+            !plan.is_final(),
+            "{ranges:?} was reported as data, which would name whole inner shards"
         );
+        let data_plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
+        assert!(data_plan.is_final(), "refining {ranges:?} gives the data");
     }
 
     Ok(())
@@ -638,6 +647,125 @@ fn an_out_of_bounds_selection_errors() -> Result<(), Box<dyn Error>> {
             "{chunk_indices:?}: unexpected error: {err}"
         );
     }
+
+    Ok(())
+}
+
+/// A nested selection is planned in two stages, and the first one is computed.
+///
+/// The data cannot be named until the subchunk indexes are read, because that is where its
+/// offsets are. What can be named without reading anything is where those indexes live.
+#[test]
+fn a_nested_plan_names_the_subchunk_indexes_first() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let subset = ArraySubset::new_with_ranges(&[0..3, 0..3]);
+
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+
+    let before = store.reads();
+    let plan = planned
+        .read_plan(&subset, &options)?
+        .expect("a nested selection is planned");
+    assert_eq!(store.reads(), before, "planning must not perform any reads");
+    assert_eq!(plan.stage(), PlanStage::SubchunkIndexes);
+    assert!(!plan.is_final(), "the indexes are not the data");
+
+    let fetched = fetch(&store, &key, &plan)?;
+    let data_plan = planned.refine_read_plan(&plan, fetched, &options)?;
+    assert!(data_plan.is_final(), "refining gives the data plan");
+    assert_eq!(store.reads(), before + plan.reads().count());
+    assert!(data_plan.num_entries() >= plan.num_entries());
+
+    Ok(())
+}
+
+/// The point of planning through the index: the reads are the innermost chunks, not the
+/// subchunks that contain them.
+///
+/// A plan that stopped at the level-zero subchunks would have to name each one whole, since
+/// it could not say where inside it the wanted bytes are. This compares the two.
+#[test]
+fn a_nested_plan_reads_less_than_the_subchunks_holding_it() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    // One innermost chunk out of each of the four subchunks of this shard.
+    let subset = ArraySubset::new_with_ranges(&[0..6, 0..6]);
+
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+    let plan = planned
+        .read_plan(&subset, &options)?
+        .expect("a nested selection is planned");
+    let data_plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
+
+    let planned_bytes: u64 = data_plan
+        .reads()
+        .map(|(_, range)| match range {
+            ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => len,
+            ByteRange::FromStart(_, None) => 0,
+        })
+        .sum();
+
+    // This selection touches every subchunk of the shard, so a plan that stopped at the
+    // subchunks would have to read the whole shard bar its outer index.
+    let shard_bytes = store.size_key(&key)?.expect("the shard is stored");
+
+    println!("planned {planned_bytes} bytes of a {shard_bytes} byte shard");
+    assert!(
+        planned_bytes * 2 < shard_bytes,
+        "planning through the index should read a fraction: {planned_bytes} of {shard_bytes}"
+    );
+    Ok(())
+}
+
+/// Refining is checked as strictly as decoding is.
+#[test]
+fn refining_rejects_bytes_that_are_not_the_indexes() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let subset = ArraySubset::new_with_ranges(&[0..2, 0..2]);
+
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+    let plan = planned
+        .read_plan(&subset, &options)?
+        .expect("a nested selection is planned");
+
+    // Right count, wrong lengths.
+    let short = vec![Some(Bytes::from_static(b"xy")); plan.num_entries()];
+    let err = planned
+        .refine_read_plan(&plan, short, &options)
+        .expect_err("bytes of the wrong length are not the indexes");
+    assert!(
+        matches!(err, CodecError::ReadPlanMismatch),
+        "unexpected: {err}"
+    );
+
+    // A final plan has nothing to refine.
+    let (flat_array, flat_store) = build(false)?;
+    let flat_key: StoreKey = flat_array.chunk_key(&[0, 0]);
+    let flat_decoder = flat_array.partial_decoder(&[0, 0])?;
+    let flat_planned = flat_decoder.as_planned().expect("sharding can plan");
+    let flat_plan = flat_planned
+        .read_plan(&subset, &options)?
+        .expect("a flat selection is planned");
+    assert!(flat_plan.is_final(), "a flat plan needs no stages");
+    let err = flat_planned
+        .refine_read_plan(
+            &flat_plan,
+            fetch(&flat_store, &flat_key, &flat_plan)?,
+            &options,
+        )
+        .expect_err("a final plan cannot be refined");
+    assert!(
+        matches!(err, CodecError::ReadPlanMismatch),
+        "unexpected: {err}"
+    );
 
     Ok(())
 }

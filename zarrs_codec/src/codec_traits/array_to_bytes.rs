@@ -48,6 +48,41 @@ pub trait ArrayToBytesCodecSubchunkingTraits: ArrayCodecTraits {
         None
     }
 
+    /// Decode the index found at [`subchunk_index_byte_range`](Self::subchunk_index_byte_range).
+    ///
+    /// Pairs offset and length for each subchunk, in the codec's own subchunk order.
+    /// [`None`] is returned by a codec with no such index, and by one whose index says the
+    /// subchunk is absent.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if `encoded` is not a valid index for `decoded_shape`.
+    fn decode_subchunk_index(
+        &self,
+        decoded_shape: &[NonZeroU64],
+        encoded: &[u8],
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<u64>>, CodecError> {
+        _ = (decoded_shape, encoded, options);
+        Ok(None)
+    }
+
+    /// The shape of one subchunk this codec's index locates, if it has one.
+    ///
+    /// Needed to walk a selection over the subchunks a decoded index describes, without
+    /// having decoded anything.
+    fn subchunk_shape(&self) -> Option<&[NonZeroU64]> {
+        None
+    }
+
+    /// The codecs that decode one of this codec's subchunks, if it has any.
+    ///
+    /// A subchunk's encoded bytes -- the bytes at a range the index gives -- decode to the
+    /// array bytes of a subchunk with the shape given by
+    /// [`subchunk_shape`](Self::subchunk_shape) using these.
+    fn subchunk_codecs(&self) -> Option<Arc<dyn ArrayToBytesCodecTraits>> {
+        None
+    }
+
     /// Return the outermost decoded subchunk grid created by this codec.
     ///
     /// This is a compatibility wrapper around [`decoded_subchunk_grids`](Self::decoded_subchunk_grids).

@@ -47,7 +47,7 @@ pub use codec_traits::bytes_partial_async::{
 };
 
 mod read_plan;
-pub use read_plan::ReadPlan;
+pub use read_plan::{PlanStage, ReadPlan};
 
 mod recommended_concurrency;
 pub use recommended_concurrency::RecommendedConcurrency;

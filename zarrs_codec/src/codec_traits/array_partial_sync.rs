@@ -7,7 +7,7 @@ use zarrs_storage::{MaybeBytes, StorageError};
 
 use crate::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, CodecError, CodecOptions, InvalidNumberOfElementsError,
-    ReadPlan, decode_into_array_bytes_target,
+    PlanStage, ReadPlan, decode_into_array_bytes_target,
 };
 
 /// Partial array decoder traits.
@@ -155,6 +155,40 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
         indexer: &dyn Indexer,
         options: &CodecOptions,
     ) -> Result<Option<ReadPlan>, CodecError>;
+
+    /// Exchange a non-final plan and its bytes for the next plan.
+    ///
+    /// A plan is non-final when its reads locate data rather than being the data --
+    /// [`PlanStage::SubchunkIndexes`]. Fetch those, hand them back here, and the result is
+    /// the plan for the data itself. Loop until
+    /// [`is_final`](ReadPlan::is_final), then call
+    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes):
+    ///
+    /// ```text
+    /// let mut plan = planned.read_plan(&subset, &options)?.unwrap();
+    /// while !plan.is_final() {
+    ///     plan = planned.refine_read_plan(&plan, fetch(plan.reads()), &options)?;
+    /// }
+    /// let bytes = planned.partial_decode_from_bytes(&plan, fetch(plan.reads()), &options)?;
+    /// ```
+    ///
+    /// Performs no I/O. `fetched` is checked against the plan exactly as
+    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes) checks its own.
+    ///
+    /// The default errors, for the decoders that only ever produce final plans.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is final, is not one this decoder
+    /// would produce, or `fetched` does not match it, or [`CodecError`] if a codec fails.
+    fn refine_read_plan(
+        &self,
+        plan: &ReadPlan,
+        fetched: Vec<MaybeBytes>,
+        options: &CodecOptions,
+    ) -> Result<ReadPlan, CodecError> {
+        _ = (plan, fetched, options);
+        Err(CodecError::ReadPlanMismatch)
+    }
 
     /// Partially decode a chunk from encoded bytes the caller already fetched.
     ///

@@ -470,6 +470,33 @@ impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for CodecChainBound {
         self.array_to_bytes.subchunk_index_byte_range(decoded_shape)
     }
 
+    fn decode_subchunk_index(
+        &self,
+        decoded_shape: &[NonZeroU64],
+        encoded: &[u8],
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<u64>>, CodecError> {
+        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
+            return Ok(None);
+        }
+        self.array_to_bytes
+            .decode_subchunk_index(decoded_shape, encoded, options)
+    }
+
+    fn subchunk_shape(&self) -> Option<&[NonZeroU64]> {
+        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
+            return None;
+        }
+        self.array_to_bytes.subchunk_shape()
+    }
+
+    fn subchunk_codecs(&self) -> Option<Arc<dyn zarrs_codec::ArrayToBytesCodecTraits>> {
+        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
+            return None;
+        }
+        self.array_to_bytes.subchunk_codecs()
+    }
+
     fn decoded_subchunk_grids(
         &self,
         decoded_chunk_grid: ChunkGridDecodedRef<'_>,
