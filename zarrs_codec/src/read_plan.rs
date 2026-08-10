@@ -16,9 +16,13 @@ use zarrs_storage::byte_range::ByteRange;
 /// itself guarantees is only that a plan cannot be paired with a *selection* other than
 /// its own; everything else is checked by the decoder when the plan comes back.
 ///
-/// A [`None`] entry marks a unit with nothing to read, which decodes to the fill value.
-/// Entries are never omitted, because their positions are the only thing tying the plan to
-/// the bytes returned for it.
+/// One entry per subchunk of the decoder's level-zero subchunk grid, in the order the
+/// bytes must be handed back. A [`None`] entry marks a subchunk with nothing to read,
+/// which decodes to the fill value. Entries are never omitted, because their positions
+/// are the only thing tying the plan to the bytes returned for it.
+///
+/// Level zero only: subchunks nested inside subchunks are not planned, since a range per
+/// level-zero subchunk would name a whole nested shard rather than the bytes wanted.
 ///
 /// The selection is an [`ArraySubset`] rather than an
 /// [`Indexer`](zarrs_chunk_grid::Indexer) because only subsets are planned today.
@@ -72,7 +76,7 @@ impl ReadPlan {
         &self.subset
     }
 
-    /// One entry per unit of encoded input, in the order the bytes must be handed back,
+    /// One entry per level-zero subchunk, in the order the bytes must be handed back,
     /// [`None`] where there is nothing to read.
     ///
     /// Use [`reads`](Self::reads) to visit only the entries with something to read.
@@ -95,7 +99,7 @@ impl ReadPlan {
 
     /// The number of entries in the plan, and so the number of byte ranges expected back.
     ///
-    /// Not the number of reads: an entry with nothing to read still holds a place, since
+    /// Not the number of reads: a subchunk with nothing to read still holds a place, since
     /// positions are what tie the plan to the bytes fetched for it.
     #[must_use]
     pub const fn num_entries(&self) -> usize {
