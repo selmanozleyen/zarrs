@@ -494,9 +494,9 @@ impl ShardingPartialDecoder {
             return None;
         }
 
-        // A plan describes one level of reads. When an inner chunk is itself
-        // subchunked -- sharding nested inside sharding -- a range per inner
-        // chunk names whole inner shards rather than the bytes actually
+        // A plan covers level-zero subchunks only. When a subchunk is itself
+        // subchunked -- sharding nested inside sharding -- a range per level-zero
+        // subchunk names a whole nested shard rather than the bytes actually
         // wanted. Report nothing rather than something misleading; the caller
         // falls back to `partial_decode`, which walks the levels itself.
         if self.nested {
