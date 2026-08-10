@@ -65,13 +65,14 @@ pub use zarrs_codec::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayBytesError, ArrayBytesFixedDisjointView,
     ArrayBytesFixedDisjointViewCreateError, ArrayBytesOffsets, ArrayBytesOptional, ArrayBytesRaw,
     ArrayBytesRawOffsetsCreateError, ArrayBytesRawOffsetsOutOfBoundsError,
-    ArrayBytesVariableLength, ArrayCodecTraits, ArrayPartialDecoderTraits,
-    ArrayPartialEncoderTraits, ArrayToArrayCodecTraits, ArrayToBytesCodecTraits,
-    BytesPartialDecoderTraits, BytesPartialEncoderTraits, BytesRepresentation,
-    BytesToBytesCodecTraits, ChunkGridDecoded, ChunkGridDecodedRef, Codec, CodecCreateError,
-    CodecError, CodecMetadataOptions, CodecOptions, CodecSpecificOptions, CodecTraits,
-    CodecTraitsV2, CodecTraitsV3, RecommendedConcurrency, UnboundArrayToArrayCodecTraits,
-    UnboundArrayToBytesCodecTraits, copy_fill_value_into, update_array_bytes,
+    ArrayBytesVariableLength, ArrayCodecTraits, ArrayPartialDecoderPlanned,
+    ArrayPartialDecoderTraits, ArrayPartialEncoderTraits, ArrayToArrayCodecTraits,
+    ArrayToBytesCodecTraits, BytesPartialDecoderTraits, BytesPartialEncoderTraits,
+    BytesRepresentation, BytesToBytesCodecTraits, ChunkGridDecoded, ChunkGridDecodedRef, Codec,
+    CodecCreateError, CodecError, CodecMetadataOptions, CodecOptions, CodecSpecificOptions,
+    CodecTraits, CodecTraitsV2, CodecTraitsV3, ReadPlan, RecommendedConcurrency,
+    UnboundArrayToArrayCodecTraits, UnboundArrayToBytesCodecTraits, copy_fill_value_into,
+    update_array_bytes,
 };
 #[cfg(feature = "async")]
 pub use zarrs_codec::{
