@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use zarrs_plugin::{MaybeSend, MaybeSync};
 use zarrs_storage::byte_range::{
-    ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges_ref,
+    ByteOffset, ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges_ref,
 };
 use zarrs_storage::{
     Bytes, OffsetBytesIterator, ReadableStorageTraits, ReadableWritableStorageTraits, StorageError,
@@ -70,19 +70,24 @@ pub trait BytesPartialDecoderTraits: Any + MaybeSend + MaybeSync {
     /// If this returns `false`, partial decoding will fall back to a full decode operation.
     fn supports_partial_decode(&self) -> bool;
 
-    /// Whether a byte range asked of this decoder is an offset into the stored value.
+    /// Where this decoder's bytes begin within the stored value, if they are part of it.
     ///
-    /// Only then can a byte range be reported to a caller who will fetch it themselves,
-    /// which is what [`ArrayPartialDecoderPlanned`](crate::ArrayPartialDecoderPlanned)
-    /// does. A decoder that transforms the bytes it sits on -- decompressing them, or
-    /// stripping a prefix -- answers offsets in its own coordinates, and a caller issuing
-    /// those against the store would read the wrong bytes with nothing to notice it by.
+    /// A byte range can only be reported to a caller who will fetch it themselves --
+    /// what [`ArrayPartialDecoderPlanned`](crate::ArrayPartialDecoderPlanned) does -- if
+    /// it can be expressed in the store's coordinates. This says how: a range at offset
+    /// `o` here is at `base + o` in the stored value.
     ///
-    /// Defaults to [`false`], so a decoder that transforms bytes declines by saying
-    /// nothing. Override it only when a byte range passes through to the stored value
-    /// unchanged.
-    fn byte_ranges_are_stored_offsets(&self) -> bool {
-        false
+    /// A decoder that transforms the bytes it sits on -- decompressing them, or stripping
+    /// a prefix -- has no such base, because its offsets are in its own coordinates and a
+    /// caller issuing them against the store would read the wrong bytes with nothing to
+    /// notice it by. Those answer [`None`], which is the default.
+    ///
+    /// A base rather than a yes/no so that handles compose: a decoder over a byte interval
+    /// of the stored value can report the interval's own start added to whatever its input
+    /// reports, which is what makes a plan for a shard nested inside a shard expressible
+    /// in the same coordinates as one for the shard itself.
+    fn stored_offset_base(&self) -> Option<ByteOffset> {
+        None
     }
 }
 
@@ -304,9 +309,9 @@ impl<TStorage: ReadableStorageTraits + 'static> BytesPartialDecoderTraits for (T
         self.0.supports_get_partial()
     }
 
-    fn byte_ranges_are_stored_offsets(&self) -> bool {
+    fn stored_offset_base(&self) -> Option<ByteOffset> {
         // This decoder *is* the stored value.
-        true
+        Some(0)
     }
 }
 

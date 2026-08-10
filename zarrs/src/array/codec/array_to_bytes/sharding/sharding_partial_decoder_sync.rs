@@ -46,14 +46,19 @@ pub struct ShardingPartialDecoder {
     /// planned call. Resolved with the options this decoder was built with, as the
     /// decoder cache below already was.
     nested: bool,
-    /// Whether the shard index's byte ranges are offsets into the stored value.
+    /// Where `input_handle` begins within the stored value, if it is part of it.
     ///
-    /// They are offsets into `input_handle`, which is the stored value only when nothing
-    /// sits in between. A bytes-to-bytes codec *outside* the sharding codec puts a
-    /// decompressor or a prefix-stripper there, and a range reported to a caller would
-    /// then name the wrong bytes of the stored value -- of the right length, so neither
-    /// the caller nor the decode would notice. Planning is declined in that case.
-    plannable_input: bool,
+    /// The shard index gives offsets into `input_handle`, and a plan has to give offsets
+    /// into the stored value, so this is the difference between the two. [`Some(0)`] for a
+    /// decoder reading a whole stored key, and the interval's start for one reading a
+    /// shard nested inside another shard.
+    ///
+    /// [`None`] when the handle transforms what it sits on -- a bytes-to-bytes codec
+    /// *outside* the sharding codec puts a decompressor or a prefix-stripper there, and a
+    /// range reported to a caller would then name the wrong bytes of the stored value, of
+    /// the right length, so neither the caller nor the decode would notice. Planning is
+    /// declined in that case.
+    plan_base: Option<ByteOffset>,
     /// Identifies this decoder, so a plan can be recognised as its own.
     ///
     /// Neither the byte ranges nor the shard index distinguish shards: equally sized
@@ -94,7 +99,7 @@ impl ShardingPartialDecoder {
             options,
         )?;
 
-        let plannable_input = input_handle.byte_ranges_are_stored_offsets();
+        let plan_base = input_handle.stored_offset_base();
         let plan_source = PLAN_SOURCE.fetch_add(1, Ordering::Relaxed);
         let mut decoder = Self {
             input_handle,
@@ -104,7 +109,7 @@ impl ShardingPartialDecoder {
             shard_index,
             sharding_options,
             nested: false,
-            plannable_input,
+            plan_base,
             plan_source,
         };
 
@@ -326,7 +331,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         // Whether a selection can be planned was resolved at construction.
         _options: &CodecOptions,
     ) -> Result<Option<ReadPlan>, CodecError> {
-        let Some((subset, _)) = self.planned_subset(indexer) else {
+        let Some((subset, _, base)) = self.planned_subset(indexer) else {
             return Ok(None);
         };
         let planned = plan_subchunk_tasks(
@@ -337,7 +342,11 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         )?;
         Ok(Some(ReadPlan::new(
             subset.to_array_subset(),
-            planned.tasks.iter().map(SubchunkTask::byte_range).collect(),
+            planned
+                .tasks
+                .iter()
+                .map(|task| task.byte_range(base))
+                .collect(),
             self.plan_source,
         )))
     }
@@ -428,7 +437,7 @@ impl ShardingPartialDecoder {
     ) -> Result<(&'a dyn ArraySubsetTraits, usize, SubchunkTasks), CodecError> {
         // A selection this decoder does not plan -- nested sharding, a variable-size
         // type -- cannot have produced this plan, so something else did.
-        let Some((subset, data_type_size)) = self.planned_subset(plan.subset()) else {
+        let Some((subset, data_type_size, base)) = self.planned_subset(plan.subset()) else {
             return Err(CodecError::ReadPlanMismatch);
         };
         let planned = plan_subchunk_tasks(
@@ -442,7 +451,8 @@ impl ShardingPartialDecoder {
             || fetched.len() != tasks.len()
             || plan.num_entries() != tasks.len()
             || izip!(plan.byte_ranges(), fetched, tasks).any(|(range, bytes, task)| {
-                *range != task.byte_range() || bytes.as_ref().map(Bytes::len) != task.fetched_len()
+                *range != task.byte_range(base)
+                    || bytes.as_ref().map(Bytes::len) != task.fetched_len()
             })
         {
             return Err(CodecError::ReadPlanMismatch);
@@ -456,12 +466,10 @@ impl ShardingPartialDecoder {
     fn planned_subset<'a>(
         &self,
         indexer: &'a dyn Indexer,
-    ) -> Option<(&'a dyn ArraySubsetTraits, usize)> {
+    ) -> Option<(&'a dyn ArraySubsetTraits, usize, ByteOffset)> {
         // A byte range is only worth reporting if the caller can issue it against the
-        // stored value and get the same bytes back.
-        if !self.plannable_input {
-            return None;
-        }
+        // stored value and get the same bytes back, which is what having a base means.
+        let base = self.plan_base?;
         // Only the fixed-size array subset path decodes one inner chunk per read.
         // Returning the size is what lets the decode path have it without asking
         // again and finding a case this rejected.
@@ -486,7 +494,7 @@ impl ShardingPartialDecoder {
             return None;
         }
 
-        Some((subset, data_type_size))
+        Some((subset, data_type_size, base))
     }
 }
 
@@ -505,9 +513,12 @@ struct SubchunkTask {
 
 impl SubchunkTask {
     /// The read this task performs, in the form a [`ReadPlan`] reports it.
-    fn byte_range(&self) -> Option<ByteRange> {
+    ///
+    /// `base` is where the decoder's input handle begins in the stored value; the shard
+    /// index counts from the handle, and a plan counts from the store.
+    fn byte_range(&self, base: ByteOffset) -> Option<ByteRange> {
         self.encoded
-            .map(|(offset, size)| ByteRange::FromStart(offset, Some(size)))
+            .map(|(offset, size)| ByteRange::FromStart(base + offset, Some(size)))
     }
 
     /// How many bytes must have been fetched for this task, if any.
