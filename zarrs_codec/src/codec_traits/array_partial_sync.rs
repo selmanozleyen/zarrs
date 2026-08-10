@@ -7,7 +7,7 @@ use zarrs_storage::{MaybeBytes, StorageError};
 
 use crate::{
     ArrayBytes, ArrayBytesDecodeIntoTarget, CodecError, CodecOptions, InvalidNumberOfElementsError,
-    PlanStage, ReadPlan, decode_into_array_bytes_target,
+    ReadPlan, decode_into_array_bytes_target,
 };
 
 /// Partial array decoder traits.
@@ -159,7 +159,7 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
     /// Exchange a non-final plan and its bytes for the next plan.
     ///
     /// A plan is non-final when its reads locate data rather than being the data --
-    /// [`PlanStage::SubchunkIndexes`]. Fetch those, hand them back here, and the result is
+    /// [`PlanStage::SubchunkIndexes`](crate::PlanStage::SubchunkIndexes). Fetch those, hand them back here, and the result is
     /// the plan for the data itself. Loop until
     /// [`is_final`](ReadPlan::is_final), then call
     /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes):

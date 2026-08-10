@@ -769,3 +769,49 @@ fn refining_rejects_bytes_that_are_not_the_indexes() -> Result<(), Box<dyn Error
 
     Ok(())
 }
+
+/// The whole nested path, against the answer the ordinary decode gives.
+///
+/// Plan, fetch the indexes, refine, fetch the data, decode. Nothing about the result should
+/// depend on having gone that way round.
+#[test]
+fn a_nested_plan_decodes_to_the_same_bytes() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+
+    for ranges in [
+        &[0..2, 0..2][..], // one innermost chunk
+        &[1..3, 1..3][..], // straddling four of them
+        &[2..6, 1..5][..], // straddling four subchunks
+        &[3..5, 2..7][..],
+        &[0..8, 0..8][..], // the whole shard
+        &[4..8, 4..8][..], // exactly one subchunk
+        &[0..1, 0..8][..], // one row
+        &[7..8, 7..8][..], // one element, last chunk
+    ] {
+        let subset = ArraySubset::new_with_ranges(ranges);
+        let want = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+
+        let plan = planned
+            .read_plan(&subset, &options)?
+            .expect("a nested selection is planned");
+        let data_plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
+        let fetched = fetch(&store, &key, &data_plan)?;
+        let before = store.reads();
+        let got = planned
+            .partial_decode_from_bytes(&data_plan, fetched, &options)?
+            .into_fixed()?;
+        assert_eq!(
+            store.reads(),
+            before,
+            "decoding from bytes must not read, {ranges:?}"
+        );
+
+        assert_eq!(got, want, "subset {ranges:?}");
+    }
+
+    Ok(())
+}
