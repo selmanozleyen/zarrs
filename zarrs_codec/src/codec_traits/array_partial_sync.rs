@@ -137,9 +137,16 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
     /// sharded array on network or parallel storage.
     ///
     /// Planning performs no reads: it is computed from state the decoder already holds.
+    /// The plan covers the decoder's level-zero subchunks, one entry each; subchunks
+    /// nested inside subchunks are not planned.
+    ///
     /// Returns [`None`] when *this indexer* cannot be planned even though the decoder
     /// plans others -- use [`partial_decode`](ArrayPartialDecoderTraits::partial_decode)
-    /// then.
+    /// then. A decoder should also decline whenever anything sits between it and the
+    /// stored bytes, such as a bytes-to-bytes codec applied outside it: the byte ranges
+    /// it holds are then offsets into a decoded stream rather than into the stored value,
+    /// and a caller issuing them against the store would read the wrong bytes at the
+    /// right lengths, with nothing to notice it by.
     ///
     /// # Errors
     /// Returns [`CodecError`] if the indexer is invalid for this decoder.
