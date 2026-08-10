@@ -81,15 +81,34 @@ pub struct ShardingPartialDecoder {
     subchunk_indexes: Option<Mutex<HashMap<u64, Arc<[u64]>>>>,
 }
 
+/// How one level-zero subchunk is read, which depends on how much of it is wanted.
+enum SubchunkReads {
+    /// Not stored: one entry with nothing to read, decoding to the fill value.
+    Absent,
+    /// Wanted entirely: one entry, the whole encoded subchunk. Its extent is in the outer
+    /// index, so this needs no index of its own and no second stage.
+    Whole(ByteRange),
+    /// Wanted in part: one entry per innermost chunk, which takes this subchunk's own index.
+    /// `base` is where the subchunk starts, since its index counts from there.
+    Innermost {
+        tasks: SubchunkTasks,
+        base: ByteOffset,
+    },
+}
+
 /// One level-zero subchunk's contribution to a nested decode.
 struct NestedSubchunk {
     /// Which subchunk this is, relative to the shard.
     chunk_indices: ArrayIndicesTinyVec,
     /// The part of the selection inside it, in subchunk-local coordinates.
     subchunk_subset: ArraySubset,
-    /// The innermost chunks it contributes and the offset their ranges count from, or
-    /// [`None`] when the subchunk is absent and all of it is the fill value.
-    inner: Option<(SubchunkTasks, ByteOffset)>,
+    reads: SubchunkReads,
+}
+
+/// Whether the selection wants all of a subchunk, so that reading it whole reads nothing
+/// that was not asked for.
+fn wants_whole_subchunk(subchunk_subset: &ArraySubset, subchunk_shape: &[NonZeroU64]) -> bool {
+    subchunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(subchunk_shape)
 }
 
 /// The walk a nested plan describes: the level-zero grid, and the innermost chunks within
@@ -107,9 +126,10 @@ impl NestedTasks {
     fn byte_ranges(&self) -> Vec<Option<ByteRange>> {
         self.subchunks
             .iter()
-            .flat_map(|subchunk| match &subchunk.inner {
-                None => vec![None],
-                Some((tasks, base)) => tasks
+            .flat_map(|subchunk| match &subchunk.reads {
+                SubchunkReads::Absent => vec![None],
+                SubchunkReads::Whole(range) => vec![Some(*range)],
+                SubchunkReads::Innermost { tasks, base } => tasks
                     .tasks
                     .iter()
                     .map(|task| task.byte_range(*base))
@@ -122,9 +142,17 @@ impl NestedTasks {
     fn fetched_lens(&self) -> Vec<Option<usize>> {
         self.subchunks
             .iter()
-            .flat_map(|subchunk| match &subchunk.inner {
-                None => vec![None],
-                Some((tasks, _)) => tasks.tasks.iter().map(SubchunkTask::fetched_len).collect(),
+            .flat_map(|subchunk| match &subchunk.reads {
+                SubchunkReads::Absent => vec![None],
+                SubchunkReads::Whole(range) => vec![match range {
+                    ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => {
+                        Some(usize::try_from(*len).unwrap_or(usize::MAX))
+                    }
+                    ByteRange::FromStart(_, None) => None,
+                }],
+                SubchunkReads::Innermost { tasks, .. } => {
+                    tasks.tasks.iter().map(SubchunkTask::fetched_len).collect()
+                }
             })
             .collect()
     }
@@ -427,33 +455,46 @@ impl ShardingPartialDecoder {
         })
     }
 
-    /// Where each touched subchunk's own index lives, in the store's coordinates.
+    /// Where the index lives for each subchunk the selection wants only part of.
     ///
-    /// The outer index says where the subchunk is; `index_within` says where inside it the
-    /// index sits. A [`Suffix`](ByteRange::Suffix) is relative to the subchunk's end, which
-    /// is why the subchunk's length is needed to make it absolute.
+    /// Nothing is reported for the others: a subchunk wanted whole is read whole, since its
+    /// extent is already in the outer index, and an absent one is not read at all. So an
+    /// empty result means no stage is needed -- the reads are already nameable.
+    ///
+    /// The outer index says where the subchunk is; `index_within` says where inside it its
+    /// index sits. A [`Suffix`](ByteRange::Suffix) counts from the subchunk's end, which is
+    /// why its length is needed to make the range absolute.
     fn subchunk_index_ranges(
+        &self,
         tasks: &SubchunkTasks,
+        subset: &dyn ArraySubsetTraits,
         base: ByteOffset,
         index_within: ByteRange,
-    ) -> Vec<Option<ByteRange>> {
-        tasks
-            .tasks
-            .iter()
-            .map(|task| {
-                task.encoded.map(|(offset, size)| match index_within {
-                    ByteRange::FromStart(within, Some(len)) => {
-                        ByteRange::FromStart(base + offset + within, Some(len))
-                    }
-                    ByteRange::FromStart(within, None) => {
-                        ByteRange::FromStart(base + offset + within, Some(size - within))
-                    }
-                    ByteRange::Suffix(len) => {
-                        ByteRange::FromStart(base + offset + size - len, Some(len))
-                    }
-                })
-            })
-            .collect()
+    ) -> Result<Vec<Option<ByteRange>>, CodecError> {
+        let subset_start = subset.start();
+        let mut ranges = Vec::new();
+        for task in &tasks.tasks {
+            let Some((offset, size)) = task.encoded else {
+                continue;
+            };
+            let (subchunk_subset, _) =
+                subchunk_subsets(&tasks.grid, subset, &subset_start, &task.chunk_indices)?;
+            if wants_whole_subchunk(&subchunk_subset, &self.subchunk_shape) {
+                continue;
+            }
+            ranges.push(Some(match index_within {
+                ByteRange::FromStart(within, Some(len)) => {
+                    ByteRange::FromStart(base + offset + within, Some(len))
+                }
+                ByteRange::FromStart(within, None) => {
+                    ByteRange::FromStart(base + offset + within, Some(size - within))
+                }
+                ByteRange::Suffix(len) => {
+                    ByteRange::FromStart(base + offset + size - len, Some(len))
+                }
+            }));
+        }
+        Ok(ranges)
     }
 
     /// The innermost chunks a selection touches, from indexes already read.
@@ -478,8 +519,14 @@ impl ShardingPartialDecoder {
         for task in &outer.tasks {
             let (subchunk_subset, _) =
                 subchunk_subsets(&outer.grid, subset, &subset_start, &task.chunk_indices)?;
-            let inner = match task.encoded {
-                None => None,
+            let reads = match task.encoded {
+                None => SubchunkReads::Absent,
+                // Wanted whole, so its own index would only tell us to read all of it.
+                Some((offset, size))
+                    if wants_whole_subchunk(&subchunk_subset, &self.subchunk_shape) =>
+                {
+                    SubchunkReads::Whole(ByteRange::FromStart(base + offset, Some(size)))
+                }
                 Some((offset, _)) => {
                     let entry = ravel_indices(&task.chunk_indices, &outer.chunks_per_shard)
                         .expect("inbounds chunk");
@@ -496,13 +543,16 @@ impl ShardingPartialDecoder {
                     )?;
                     // The base composes: this subchunk starts `offset` into whatever the
                     // outer base already accounts for.
-                    Some((tasks, base + offset))
+                    SubchunkReads::Innermost {
+                        tasks,
+                        base: base + offset,
+                    }
                 }
             };
             subchunks.push(NestedSubchunk {
                 chunk_indices: task.chunk_indices.clone(),
                 subchunk_subset,
-                inner,
+                reads,
             });
         }
         Ok(NestedTasks {
@@ -573,11 +623,32 @@ impl ShardingPartialDecoder {
             let output_subset = output_subset.offset(output_view.subset().start())?;
             // SAFETY: subchunks represent disjoint array subsets
             let mut subchunk_view = unsafe { output_view.subdivide(output_subset)? };
-            let Some((tasks, _)) = subchunk.inner else {
-                // One entry stood for the whole absent subchunk.
-                let _ = rest.next();
-                subchunk_view.fill(fill_value.as_ne_bytes())?;
-                continue;
+            let tasks = match subchunk.reads {
+                SubchunkReads::Absent => {
+                    // One entry stood for the whole absent subchunk.
+                    let _ = rest.next();
+                    subchunk_view.fill(fill_value.as_ne_bytes())?;
+                    continue;
+                }
+                SubchunkReads::Whole(_) => {
+                    // The whole subchunk came back, so its own decoder reads it from memory
+                    // and takes the part that was wanted.
+                    let encoded = rest.next().ok_or(CodecError::ReadPlanMismatch)?;
+                    let Some(encoded) = encoded else {
+                        subchunk_view.fill(fill_value.as_ne_bytes())?;
+                        continue;
+                    };
+                    self.inner_codecs
+                        .clone()
+                        .partial_decoder(Arc::new(encoded), &self.subchunk_shape, options)?
+                        .partial_decode_into(
+                            &subchunk.subchunk_subset,
+                            ArrayBytesDecodeIntoTarget::Fixed(&mut subchunk_view),
+                            options,
+                        )?;
+                    continue;
+                }
+                SubchunkReads::Innermost { tasks, .. } => tasks,
             };
             let inner_start = &subchunk.subchunk_subset.start();
             for task in &tasks.tasks {
@@ -653,14 +724,20 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
             self.shard_index.as_deref(),
             subset,
         )?;
-        // Where subchunks are subchunked, the data cannot be named yet: its offsets are in
-        // indexes that have not been read. Name those instead, one per touched subchunk.
+        // Where subchunks are subchunked, a subchunk wanted only in part cannot be named
+        // yet: the offsets inside it are in an index that has not been read. Name those
+        // indexes instead. A selection that wants whole subchunks needs none of this and
+        // falls through -- the ranges below are exactly those subchunks' extents.
         if let Some(geometry) = self.nested_geometry() {
-            return Ok(Some(ReadPlan::new_subchunk_indexes(
-                subset.to_array_subset(),
-                Self::subchunk_index_ranges(&planned, base, geometry.index_within),
-                self.plan_source,
-            )));
+            let index_ranges =
+                self.subchunk_index_ranges(&planned, subset, base, geometry.index_within)?;
+            if !index_ranges.is_empty() {
+                return Ok(Some(ReadPlan::new_subchunk_indexes(
+                    subset.to_array_subset(),
+                    index_ranges,
+                    self.plan_source,
+                )));
+            }
         }
         Ok(Some(ReadPlan::new(
             subset.to_array_subset(),
@@ -696,17 +773,17 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         )?;
         // The same checks a returned data plan gets: the reads this decoder would have
         // reported, and bytes of the length each asked for.
-        let expected = Self::subchunk_index_ranges(&outer, base, geometry.index_within);
+        let expected = self.subchunk_index_ranges(&outer, subset, base, geometry.index_within)?;
         if plan.source() != self.plan_source
             || plan.num_entries() != expected.len()
             || fetched.len() != expected.len()
             || plan.byte_ranges() != expected.as_slice()
             || izip!(&expected, &fetched).any(|(range, bytes)| {
-                let wanted = range.map(|range| match range {
+                let wanted = range.and_then(|range| match range {
                     ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => {
-                        usize::try_from(len).unwrap_or(usize::MAX)
+                        Some(usize::try_from(len).unwrap_or(usize::MAX))
                     }
-                    ByteRange::FromStart(_, None) => usize::MAX,
+                    ByteRange::FromStart(_, None) => None,
                 });
                 bytes.as_ref().map(Bytes::len) != wanted
             })
@@ -714,37 +791,31 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
             return Err(CodecError::ReadPlanMismatch);
         }
 
+        // Decode each index in the order it was reported, which is the order the subchunks
+        // wanted in part appear in.
         let subset_start = subset.start();
-        let mut byte_ranges = Vec::with_capacity(outer.tasks.len());
-        for (task, index_bytes) in izip!(&outer.tasks, fetched) {
-            let (Some((offset, _)), Some(index_bytes)) = (task.encoded, index_bytes) else {
-                // An absent subchunk keeps its place with nothing to read, as at any level.
-                byte_ranges.push(None);
-                continue;
-            };
-            let entry = ravel_indices(&task.chunk_indices, &outer.chunks_per_shard)
-                .expect("inbounds chunk");
-            let index = self.cached_subchunk_index(entry, &index_bytes, options)?;
+        let mut indexes = fetched.into_iter();
+        for task in &outer.tasks {
+            let Some((_, _)) = task.encoded else { continue };
             let (subchunk_subset, _) =
                 subchunk_subsets(&outer.grid, subset, &subset_start, &task.chunk_indices)?;
-            let inner = plan_subchunk_tasks(
-                &self.subchunk_shape,
-                geometry.innermost_shape,
-                Some(&index),
-                &subchunk_subset,
-            )?;
-            // The base composes: this subchunk starts `offset` into what the outer base
-            // already accounts for, so its own ranges land in the store's coordinates.
-            byte_ranges.extend(
-                inner
-                    .tasks
-                    .iter()
-                    .map(|task| task.byte_range(base + offset)),
-            );
+            if wants_whole_subchunk(&subchunk_subset, &self.subchunk_shape) {
+                continue;
+            }
+            let encoded = indexes
+                .next()
+                .flatten()
+                .ok_or(CodecError::ReadPlanMismatch)?;
+            let entry = ravel_indices(&task.chunk_indices, &outer.chunks_per_shard)
+                .expect("inbounds chunk");
+            self.cached_subchunk_index(entry, &encoded, options)?;
         }
+
+        // Built by the same walk the decode will rebuild, so the two cannot disagree.
+        let nested = self.nested_tasks(subset, base)?;
         Ok(ReadPlan::new(
             subset.to_array_subset(),
-            byte_ranges,
+            nested.byte_ranges(),
             self.plan_source,
         ))
     }

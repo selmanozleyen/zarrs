@@ -291,7 +291,7 @@ fn nested_sharding_decodes_the_same_values() -> Result<(), Box<dyn Error>> {
 /// nested decoder saying yes to the first and no to the second is the shape the
 /// caller has to handle for every subset it asks about.
 #[test]
-fn nested_sharding_stages_every_subset() -> Result<(), Box<dyn Error>> {
+fn nested_sharding_plans_every_subset() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
     let (array, store) = build(true)?;
     let key: StoreKey = array.chunk_key(&[0, 0]);
@@ -306,15 +306,16 @@ fn nested_sharding_stages_every_subset() -> Result<(), Box<dyn Error>> {
         &[4..8, 4..8][..], // exactly one inner shard
     ] {
         let subset = ArraySubset::new_with_ranges(ranges);
-        let plan = planned
+        let mut plan = planned
             .read_plan(&subset, &options)?
             .expect("every nested subset is planned");
-        assert!(
-            !plan.is_final(),
-            "{ranges:?} was reported as data, which would name whole inner shards"
-        );
-        let data_plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
-        assert!(data_plan.is_final(), "refining {ranges:?} gives the data");
+        // At most one exchange, and what comes out of it is always the data.
+        let mut rounds = 0;
+        while !plan.is_final() {
+            plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
+            rounds += 1;
+            assert!(rounds <= 1, "{ranges:?} took more than one exchange");
+        }
     }
 
     Ok(())
@@ -726,8 +727,7 @@ fn a_nested_plan_reads_less_than_the_subchunks_holding_it() -> Result<(), Box<dy
 #[test]
 fn refining_rejects_bytes_that_are_not_the_indexes() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
-    let (array, store) = build(true)?;
-    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let (array, _) = build(true)?;
     let subset = ArraySubset::new_with_ranges(&[0..2, 0..2]);
 
     let decoder = array.partial_decoder(&[0, 0])?;
@@ -795,10 +795,13 @@ fn a_nested_plan_decodes_to_the_same_bytes() -> Result<(), Box<dyn Error>> {
         let subset = ArraySubset::new_with_ranges(ranges);
         let want = decoder.partial_decode(&subset, &options)?.into_fixed()?;
 
-        let plan = planned
+        let mut data_plan = planned
             .read_plan(&subset, &options)?
             .expect("a nested selection is planned");
-        let data_plan = planned.refine_read_plan(&plan, fetch(&store, &key, &plan)?, &options)?;
+        while !data_plan.is_final() {
+            data_plan =
+                planned.refine_read_plan(&data_plan, fetch(&store, &key, &data_plan)?, &options)?;
+        }
         let fetched = fetch(&store, &key, &data_plan)?;
         let before = store.reads();
         let got = planned
@@ -812,6 +815,50 @@ fn a_nested_plan_decodes_to_the_same_bytes() -> Result<(), Box<dyn Error>> {
 
         assert_eq!(got, want, "subset {ranges:?}");
     }
+
+    Ok(())
+}
+
+/// A selection that wants whole subchunks needs no second round.
+///
+/// The subchunk's extent is already in the outer index, so its own index would only say to
+/// read all of it. Nesting costs an extra round exactly when part of a subchunk is wanted.
+#[test]
+fn wanting_whole_subchunks_needs_no_index_round() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = decoder.as_planned().expect("sharding can plan");
+
+    for ranges in [
+        &[0..8, 0..8][..], // the whole shard: four whole subchunks
+        &[4..8, 4..8][..], // exactly one subchunk
+        &[0..4, 0..8][..], // two whole subchunks
+    ] {
+        let subset = ArraySubset::new_with_ranges(ranges);
+        let plan = planned
+            .read_plan(&subset, &options)?
+            .expect("planned in one go");
+        assert!(
+            plan.is_final(),
+            "{ranges:?} wants whole subchunks, so it needs no index round"
+        );
+        let want = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+        let got = planned
+            .partial_decode_from_bytes(&plan, fetch(&store, &key, &plan)?, &options)?
+            .into_fixed()?;
+        assert_eq!(got, want, "subset {ranges:?}");
+    }
+
+    // And one that wants part of a subchunk still stages.
+    assert!(
+        !planned
+            .read_plan(&ArraySubset::new_with_ranges(&[0..3, 0..3]), &options)?
+            .expect("planned")
+            .is_final(),
+        "part of a subchunk needs its index"
+    );
 
     Ok(())
 }
