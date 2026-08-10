@@ -456,10 +456,10 @@ impl UnboundArrayToBytesCodecTraits for CodecChain {
 }
 
 impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for CodecChainBound {
-    fn subchunk_index_byte_range(
+    fn subchunk_geometry(
         &self,
         decoded_shape: &[NonZeroU64],
-    ) -> Option<zarrs_storage::byte_range::ByteRange> {
+    ) -> Option<Arc<zarrs_codec::SubchunkGeometry>> {
         // Only the bare codec can answer. An array-to-array codec changes what
         // `decoded_shape` describes, and a bytes-to-bytes codec moves the index somewhere
         // else in the encoded chunk -- in both cases a range from the inner codec would
@@ -467,7 +467,7 @@ impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for CodecChainBound {
         if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
             return None;
         }
-        self.array_to_bytes.subchunk_index_byte_range(decoded_shape)
+        self.array_to_bytes.subchunk_geometry(decoded_shape)
     }
 
     fn decode_subchunk_index(
@@ -481,20 +481,6 @@ impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for CodecChainBound {
         }
         self.array_to_bytes
             .decode_subchunk_index(decoded_shape, encoded, options)
-    }
-
-    fn subchunk_shape(&self) -> Option<&[NonZeroU64]> {
-        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
-            return None;
-        }
-        self.array_to_bytes.subchunk_shape()
-    }
-
-    fn subchunk_codecs(&self) -> Option<Arc<dyn zarrs_codec::ArrayToBytesCodecTraits>> {
-        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
-            return None;
-        }
-        self.array_to_bytes.subchunk_codecs()
     }
 
     fn decoded_subchunk_grids(

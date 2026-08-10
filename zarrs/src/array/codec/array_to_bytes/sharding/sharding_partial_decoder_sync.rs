@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use itertools::izip;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs_chunk_grid::{ArraySubset, ChunkGridTraits};
-use zarrs_codec::{ArrayToBytesCodecSubchunkingTraits, PlanStage};
+use zarrs_codec::{ArrayToBytesCodecSubchunkingTraits, PlanStage, SubchunkGeometry};
 
 use super::{
     ShardingCodecOptions, ShardingIndexLocation, calculate_chunks_per_shard,
@@ -41,13 +41,6 @@ pub struct ShardingPartialDecoder {
     shard_index: Option<Vec<u64>>,
     #[expect(dead_code)] // TODO: Remove when sharding-specific options are added
     sharding_options: ShardingCodecOptions,
-    /// Whether an inner chunk is itself a shard, resolved once at construction.
-    ///
-    /// Answering it walks the codec chain, and it decides both whether inner decoders
-    /// are worth keeping and whether a selection can be planned -- the latter on every
-    /// planned call. Resolved with the options this decoder was built with, as the
-    /// decoder cache below already was.
-    nested: bool,
     /// Where `input_handle` begins within the stored value, if it is part of it.
     ///
     /// The shard index gives offsets into `input_handle`, and a plan has to give offsets
@@ -68,7 +61,7 @@ pub struct ShardingPartialDecoder {
     /// have byte-identical indexes and byte-identical plans. Only identity separates
     /// them, and a decoder is the thing that holds a shard's index, so identity is
     /// per decoder.
-    plan_source: u64,
+    plan_source: OnceLock<u64>,
     /// Decoded indexes of subchunks that are themselves subchunked, keyed by the
     /// subchunk's linear entry in this shard.
     ///
@@ -77,8 +70,12 @@ pub struct ShardingPartialDecoder {
     /// an index is a value, sized exactly `2 * chunks_per_subchunk` u64s, where a decoder
     /// would also hold the handle it was built on and a clone of its codec chain.
     ///
-    /// [`None`] unless the subchunks are subchunked, when there is nothing to keep.
-    subchunk_indexes: Option<Mutex<HashMap<u64, Arc<[u64]>>>>,
+    /// Empty, and costing nothing, for a decoder whose subchunks are not subchunked or that
+    /// is never asked to plan. Bounded by the subchunks per shard, and shares this
+    /// decoder's snapshot semantics: like [`shard_index`](Self::shard_index) it reflects
+    /// the shard as it was read, so a concurrent writer invalidates the decoder as a
+    /// whole, not this cache in particular.
+    subchunk_indexes: Mutex<HashMap<u64, Arc<[u64]>>>,
 }
 
 /// How one level-zero subchunk is read, which depends on how much of it is wanted.
@@ -158,21 +155,14 @@ impl NestedTasks {
     }
 }
 
-/// What planning one level down needs, when there is a level down to plan.
-struct NestedGeometry<'a> {
-    /// Where a subchunk's own index sits within that subchunk.
-    index_within: ByteRange,
-    /// The shape of the chunks that index locates.
-    innermost_shape: &'a [NonZeroU64],
-}
-
 /// Hands each decoder an identity, so a plan can be recognised as its own.
 ///
 /// A counter rather than a hash of anything: what has to be told apart is which shard
 /// the bytes came from, and two shards of one array are indistinguishable by content.
 /// Rebuilding a decoder therefore invalidates plans it did not make, which is the safe
 /// direction.
-static PLAN_SOURCE: AtomicU64 = AtomicU64::new(0);
+// From one, so that a plan built by hand with a zero source matches no decoder.
+static PLAN_SOURCE: AtomicU64 = AtomicU64::new(1);
 
 impl ShardingPartialDecoder {
     /// Create a new partial decoder for the sharding codec.
@@ -197,27 +187,17 @@ impl ShardingPartialDecoder {
         )?;
 
         let plan_base = input_handle.stored_offset_base();
-        let plan_source = PLAN_SOURCE.fetch_add(1, Ordering::Relaxed);
-        let mut decoder = Self {
+        Ok(Self {
             input_handle,
             shard_shape,
             subchunk_shape,
             inner_codecs,
             shard_index,
             sharding_options,
-            nested: false,
             plan_base,
-            plan_source,
-            subchunk_indexes: None,
-        };
-
-        // More than one level in the local grid hierarchy means the inner chunk is
-        // itself a shard carrying its own index.
-        decoder.nested = decoder.local_subchunk_grids(options)?.len() > 1;
-        if decoder.nested {
-            decoder.subchunk_indexes = Some(Mutex::new(HashMap::new()));
-        }
-        Ok(decoder)
+            plan_source: OnceLock::new(),
+            subchunk_indexes: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Retrieve the byte range of an encoded subchunk.
@@ -426,33 +406,34 @@ impl ArrayPartialDecoderTraits for ShardingPartialDecoder {
 }
 
 impl ShardingPartialDecoder {
+    /// This decoder's identity, minted the first time it is needed.
+    ///
+    /// Lazy because a decoder that is never asked to plan should cost what it cost before
+    /// planning existed, and most are never asked: on a nested array the ordinary decode
+    /// path builds one per subchunk, from every worker thread.
+    fn plan_source(&self) -> u64 {
+        *self
+            .plan_source
+            .get_or_init(|| PLAN_SOURCE.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// The geometry one level in, if the subchunks are subchunked exactly once more and
     /// nothing about them stands in the way of planning.
     ///
     /// Everything here is computed from metadata: where a subchunk's index sits within it
     /// has a fixed size at a known place, so it is known before anything is read.
-    fn nested_geometry(&self) -> Option<NestedGeometry<'_>> {
-        if !self.nested {
-            return None;
-        }
-        let index_within = self
-            .inner_codecs
-            .subchunk_index_byte_range(&self.subchunk_shape)?;
-        let innermost_shape = self.inner_codecs.subchunk_shape()?;
-        // One extra level only. A subchunk of a subchunk that is subchunked again would
-        // need its index read after this stage, and there is only one exchange.
-        if self
-            .inner_codecs
-            .subchunk_codecs()?
-            .subchunk_shape()
+    fn nested_geometry(&self) -> Option<Arc<SubchunkGeometry>> {
+        let geometry = self.inner_codecs.subchunk_geometry(&self.subchunk_shape)?;
+        // One extra level only. A subchunk of a subchunk that is subchunked again would need
+        // its index read after this stage, and there is only one exchange.
+        if geometry
+            .codecs()
+            .subchunk_geometry(geometry.shape())
             .is_some()
         {
             return None;
         }
-        Some(NestedGeometry {
-            index_within,
-            innermost_shape,
-        })
+        Some(geometry)
     }
 
     /// Where the index lives for each subchunk the selection wants only part of.
@@ -532,12 +513,14 @@ impl ShardingPartialDecoder {
                         .expect("inbounds chunk");
                     let index = self
                         .subchunk_indexes
-                        .as_ref()
-                        .and_then(|cache| cache.lock().unwrap().get(&entry).cloned())
+                        .lock()
+                        .unwrap()
+                        .get(&entry)
+                        .cloned()
                         .ok_or(CodecError::ReadPlanMismatch)?;
                     let tasks = plan_subchunk_tasks(
                         &self.subchunk_shape,
-                        geometry.innermost_shape,
+                        geometry.shape(),
                         Some(&index),
                         &subchunk_subset,
                     )?;
@@ -574,7 +557,7 @@ impl ShardingPartialDecoder {
         let nested = self.nested_tasks(subset, base)?;
         let ranges = nested.byte_ranges();
         let lens = nested.fetched_lens();
-        if plan.source() != self.plan_source
+        if plan.source() != self.plan_source()
             || plan.num_entries() != ranges.len()
             || fetched.len() != ranges.len()
             || plan.byte_ranges() != ranges.as_slice()
@@ -601,14 +584,9 @@ impl ShardingPartialDecoder {
         options: &CodecOptions,
         output_view: &mut ArrayBytesFixedDisjointView<'_>,
     ) -> Result<(), CodecError> {
-        let innermost_codecs = self
-            .inner_codecs
-            .subchunk_codecs()
-            .ok_or(CodecError::ReadPlanMismatch)?;
-        let innermost_shape = self
-            .inner_codecs
-            .subchunk_shape()
-            .ok_or(CodecError::ReadPlanMismatch)?;
+        let geometry = self.nested_geometry().ok_or(CodecError::ReadPlanMismatch)?;
+        let innermost_codecs = geometry.codecs();
+        let innermost_shape = geometry.shape();
         let fill_value = self.inner_codecs.fill_value();
         let array_subset_start = array_subset.start();
 
@@ -689,9 +667,7 @@ impl ShardingPartialDecoder {
         encoded: &[u8],
         options: &CodecOptions,
     ) -> Result<Arc<[u64]>, CodecError> {
-        if let Some(cache) = &self.subchunk_indexes
-            && let Some(index) = cache.lock().unwrap().get(&entry)
-        {
+        if let Some(index) = self.subchunk_indexes.lock().unwrap().get(&entry) {
             return Ok(index.clone());
         }
         // Decoded outside the lock: holding it across a decode would serialise every
@@ -701,10 +677,13 @@ impl ShardingPartialDecoder {
             .decode_subchunk_index(&self.subchunk_shape, encoded, options)?
             .ok_or(CodecError::ReadPlanMismatch)?
             .into();
-        Ok(match &self.subchunk_indexes {
-            Some(cache) => cache.lock().unwrap().entry(entry).or_insert(index).clone(),
-            None => index,
-        })
+        Ok(self
+            .subchunk_indexes
+            .lock()
+            .unwrap()
+            .entry(entry)
+            .or_insert(index)
+            .clone())
     }
 }
 
@@ -730,12 +709,12 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         // falls through -- the ranges below are exactly those subchunks' extents.
         if let Some(geometry) = self.nested_geometry() {
             let index_ranges =
-                self.subchunk_index_ranges(&planned, subset, base, geometry.index_within)?;
+                self.subchunk_index_ranges(&planned, subset, base, geometry.index_within())?;
             if !index_ranges.is_empty() {
                 return Ok(Some(ReadPlan::new_subchunk_indexes(
                     subset.to_array_subset(),
                     index_ranges,
-                    self.plan_source,
+                    self.plan_source(),
                 )));
             }
         }
@@ -746,7 +725,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
                 .iter()
                 .map(|task| task.byte_range(base))
                 .collect(),
-            self.plan_source,
+            self.plan_source(),
         )))
     }
 
@@ -773,8 +752,8 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         )?;
         // The same checks a returned data plan gets: the reads this decoder would have
         // reported, and bytes of the length each asked for.
-        let expected = self.subchunk_index_ranges(&outer, subset, base, geometry.index_within)?;
-        if plan.source() != self.plan_source
+        let expected = self.subchunk_index_ranges(&outer, subset, base, geometry.index_within())?;
+        if plan.source() != self.plan_source()
             || plan.num_entries() != expected.len()
             || fetched.len() != expected.len()
             || plan.byte_ranges() != expected.as_slice()
@@ -816,7 +795,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         Ok(ReadPlan::new(
             subset.to_array_subset(),
             nested.byte_ranges(),
-            self.plan_source,
+            self.plan_source(),
         ))
     }
 
@@ -826,7 +805,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         fetched: Vec<MaybeBytes>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError> {
-        let (subset, data_type_size, planned, nested) = if self.nested {
+        let (subset, data_type_size, planned, nested) = if self.nested_geometry().is_some() {
             let (subset, size, nested) = self.checked_nested_tasks(plan, &fetched)?;
             (subset, size, None, Some(nested))
         } else {
@@ -890,7 +869,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         };
         // Straight into the caller's view: the inner chunks already decode into subdivisions
         // of whatever view they are given, so there is nothing for an owned buffer to do.
-        if self.nested {
+        if self.nested_geometry().is_some() {
             let (subset, _, nested) = self.checked_nested_tasks(plan, &fetched)?;
             return self.nested_decode_from_bytes_into(
                 nested,
@@ -941,7 +920,7 @@ impl ShardingPartialDecoder {
             subset,
         )?;
         let tasks = &planned.tasks;
-        if plan.source() != self.plan_source
+        if plan.source() != self.plan_source()
             || fetched.len() != tasks.len()
             || plan.num_entries() != tasks.len()
             || izip!(plan.byte_ranges(), fetched, tasks).any(|(range, bytes, task)| {
@@ -976,14 +955,6 @@ impl ShardingPartialDecoder {
         }
         let subset = indexer.as_array_subset()?;
         if subset.dimensionality() != self.shard_shape.len() {
-            return None;
-        }
-
-        // A subchunk that is itself subchunked is planned one level further in, which
-        // needs its index -- so it is only plannable if this decoder can say where that
-        // index lives. Deeper than one extra level is not planned: `refine_read_plan`
-        // exchanges one stage, and a third level would need a second exchange.
-        if self.nested && self.nested_geometry().is_none() {
             return None;
         }
 

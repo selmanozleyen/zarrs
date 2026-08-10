@@ -47,6 +47,7 @@ pub use codec_traits::bytes_partial_async::{
 };
 
 mod read_plan;
+pub use codec_traits::array_to_bytes::SubchunkGeometry;
 pub use read_plan::{PlanStage, ReadPlan};
 
 mod recommended_concurrency;

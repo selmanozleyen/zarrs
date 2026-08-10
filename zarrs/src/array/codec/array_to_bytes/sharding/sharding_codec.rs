@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::num::NonZeroU64;
 use std::ops::IndexMut;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
@@ -26,6 +26,7 @@ use crate::array::{
     ChunkGrid, ChunkShape, ChunkShapeTraits, CodecChainBound, DataType, DataTypeSize, FillValue,
     chunk_shape_to_array_shape, transmute_to_bytes_vec, unravel_index,
 };
+use zarrs_codec::SubchunkGeometry;
 use zarrs_codec::{
     ArrayBytesDecodeIntoTarget, ArrayCodecTraits, ArrayPartialDecoderTraits,
     ArrayPartialEncoderTraits, ArrayToBytesCodecTraits, BytesPartialDecoderTraits,
@@ -150,6 +151,14 @@ pub struct ShardingCodecBound {
     pub(crate) index_codecs: Arc<CodecChainBound>,
     pub(crate) index_location: ShardingIndexLocation,
     pub(crate) options: ShardingCodecOptions,
+    /// The subchunk geometry, resolved once, with the shape it was resolved for.
+    ///
+    /// This codec is shared by every partial decoder of an array, and the geometry is a
+    /// function of immutable configuration and the chunk shape -- which is the same for
+    /// every chunk of a regular grid. So the first decoder to ask pays, and the rest read.
+    /// A shape other than the memoised one is answered without caching, rather than
+    /// answered wrongly.
+    pub(crate) subchunk_geometry: OnceLock<(Vec<NonZeroU64>, Option<Arc<SubchunkGeometry>>)>,
 }
 
 impl ShardingCodec {
@@ -270,6 +279,7 @@ impl UnboundArrayToBytesCodecTraits for ShardingCodec {
             index_codecs,
             index_location: self.index_location,
             options: self.options.clone(),
+            subchunk_geometry: OnceLock::new(),
         }))
     }
 
@@ -310,15 +320,41 @@ impl ArrayCodecTraits for ShardingCodecBound {
     }
 }
 
-impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for ShardingCodecBound {
-    fn subchunk_index_byte_range(
+impl ShardingCodecBound {
+    /// Work out the subchunk geometry from configuration. Memoised by
+    /// [`subchunk_geometry`](zarrs_codec::ArrayToBytesCodecSubchunkingTraits::subchunk_geometry).
+    fn resolve_subchunk_geometry(
         &self,
         decoded_shape: &[NonZeroU64],
-    ) -> Option<zarrs_storage::byte_range::ByteRange> {
+    ) -> Option<Arc<SubchunkGeometry>> {
         let chunks_per_shard =
             super::calculate_chunks_per_shard(decoded_shape, &self.subchunk_shape).ok()?;
         let index_shape = super::sharding_index_shape(&chunks_per_shard);
-        super::get_index_byte_range(&index_shape, &self.index_codecs, self.index_location).ok()
+        let index_within =
+            super::get_index_byte_range(&index_shape, &self.index_codecs, self.index_location)
+                .ok()?;
+        Some(Arc::new(SubchunkGeometry::new(
+            index_within,
+            self.subchunk_shape.to_vec(),
+            self.inner_codecs.clone(),
+        )))
+    }
+}
+
+impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for ShardingCodecBound {
+    fn subchunk_geometry(&self, decoded_shape: &[NonZeroU64]) -> Option<Arc<SubchunkGeometry>> {
+        if let Some((shape, geometry)) = self.subchunk_geometry.get()
+            && shape == decoded_shape
+        {
+            return geometry.clone();
+        }
+        let geometry = self.resolve_subchunk_geometry(decoded_shape);
+        // Only the first shape is kept. Another one is a different array using this codec,
+        // which is not what the memo is for.
+        let _ = self
+            .subchunk_geometry
+            .set((decoded_shape.to_vec(), geometry.clone()));
+        geometry
     }
 
     fn decode_subchunk_index(
@@ -331,14 +367,6 @@ impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for ShardingCodecBound {
             super::calculate_chunks_per_shard(decoded_shape, &self.subchunk_shape)?;
         let index_shape = super::sharding_index_shape(&chunks_per_shard);
         super::decode_shard_index(encoded, &index_shape, &self.index_codecs, options).map(Some)
-    }
-
-    fn subchunk_shape(&self) -> Option<&[NonZeroU64]> {
-        Some(&self.subchunk_shape)
-    }
-
-    fn subchunk_codecs(&self) -> Option<Arc<dyn zarrs_codec::ArrayToBytesCodecTraits>> {
-        Some(self.inner_codecs.clone())
     }
 
     fn decoded_subchunk_grids(
