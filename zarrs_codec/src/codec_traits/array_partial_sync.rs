@@ -196,6 +196,23 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
         Err(CodecError::ReadPlanMismatch)
     }
 
+    /// Implementor side of [`DataPlan::fill_absent_into`]: fill the parts of the output
+    /// whose units have nothing to read.
+    ///
+    /// Performs no I/O -- which units are absent is known from the state the plan was
+    /// built from. The implementation checks `plan` is one it minted, exactly as the
+    /// decode entry points do.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder
+    /// produced, or [`CodecError`] if the output is invalid for the plan's selection.
+    fn fill_absent_into(
+        &self,
+        plan: &DataPlan,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError>;
+
     /// Implementor side of [`DataPlan::decode`]: partially decode a chunk from encoded
     /// bytes the caller already fetched.
     ///
@@ -204,15 +221,20 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
     /// performs no I/O.
     ///
     /// Entries are [`MaybeBytes`] -- exactly what a store hands back -- so the caller does
-    /// not have to convert or copy them to hand them over. A [`None`] entry is one the plan
-    /// said there was nothing to read for.
+    /// not have to convert or copy them to hand them over. Every entry is a read, so
+    /// [`None`] never matches the plan: a store answering [`None`] means the stored value
+    /// changed since planning, and the decode reports the mismatch rather than guessing.
     ///
-    /// The implementation checks `plan` and `fetched` against the reads it would have
-    /// performed itself: the number of entries, the range of each, and the length of the
-    /// bytes supplied for it. The plan holding this decoder does not prove the ranges are
-    /// its, since plans are publicly constructible. It cannot check the *order*, since
-    /// entries of equal length are indistinguishable, so handing back bytes in plan order
-    /// is the caller's side of the contract.
+    /// The implementation checks `plan` and `fetched` against the reads it planned: that
+    /// the plan carries state it minted itself, that the ranges are the state's, and that
+    /// the bytes supplied for each entry have the length its range asked for. A plan
+    /// built through the public constructors carries no such state and is rejected. The
+    /// implementation cannot check the *order* of `fetched`, since entries of equal
+    /// length are indistinguishable, so handing back bytes in plan order is the caller's
+    /// side of the contract.
+    ///
+    /// The result is complete: units with nothing to read decode to the fill value, as
+    /// [`fill_absent_into`](Self::fill_absent_into) would fill them.
     ///
     /// # Errors
     /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder would
@@ -232,7 +254,9 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
     /// A caller assembling one output from several decoders wants this rather than the
     /// owned form, which has to allocate a buffer per call and copy it into place. The
     /// default does exactly that; an implementor that can decode straight into
-    /// `output_target` should override it.
+    /// `output_target` should override it. (The default therefore also writes fill
+    /// values where an override would leave [`fill_absent_into`](Self::fill_absent_into)
+    /// to do it -- the same values, so a caller doing both stays correct either way.)
     ///
     /// # Errors
     /// Returns [`InvalidNumberOfElementsError`] if the plan's selection and

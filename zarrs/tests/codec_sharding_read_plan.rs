@@ -37,20 +37,16 @@ const fn nz(v: u64) -> NonZeroU64 {
 /// Do a plan's reads, in whatever order the caller likes.
 ///
 /// What the store returns goes straight back to the decoder -- no copy, and no
-/// conversion to talk it into the decoder's argument type. Entries with nothing to
-/// read keep their place without being visited.
+/// conversion to talk it into the decoder's argument type. Every entry is a read.
 fn fetch(
     store: &TestStore,
     key: &StoreKey,
-    byte_ranges: &[Option<ByteRange>],
+    byte_ranges: &[ByteRange],
 ) -> Result<Vec<MaybeBytes>, Box<dyn Error>> {
-    let mut fetched = vec![None; byte_ranges.len()];
-    for (entry, byte_range) in byte_ranges.iter().enumerate() {
-        if let Some(byte_range) = byte_range {
-            fetched[entry] = store.get_partial(key, *byte_range)?;
-        }
-    }
-    Ok(fetched)
+    byte_ranges
+        .iter()
+        .map(|byte_range| Ok(store.get_partial(key, *byte_range)?))
+        .collect()
 }
 
 /// The decoder as a planning one, which sharding always is.
@@ -178,12 +174,13 @@ fn plan_then_decode_from_bytes_matches_and_reads_nothing() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// A shard with no inner chunk present still reports one entry per chunk, so
-/// the plan stays one-to-one with what decoding expects.
+/// A shard with no inner chunk present plans no reads at all: an absent chunk is
+/// not a read, so it is not an entry. The whole selection is the fill value,
+/// which `fill_absent_into` writes without any fetched data.
 #[test]
 fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
     let options = CodecOptions::default();
-    let (array, _) = build(false)?;
+    let (array, store) = build(false)?;
     let subset = ArraySubset::new_with_ranges(&[0..4, 0..4]);
 
     // Chunk [1, 1] was written; erase it so the shard is absent.
@@ -194,17 +191,30 @@ fn plan_covers_a_missing_shard() -> Result<(), Box<dyn Error>> {
             .read_plan(&subset, &options)?
             .expect("sharding reports its reads"),
     );
-    assert_eq!(
-        plan.num_entries(),
-        4,
-        "one entry per inner chunk in the subset"
-    );
-    assert_eq!(plan.reads().count(), 0, "but nothing to read");
+    assert_eq!(plan.num_entries(), 0, "nothing stored, so nothing to read");
 
-    let got = plan
-        .decode(vec![None; plan.num_entries()], &options)?
-        .into_fixed()?;
+    // The owned form fills its own buffer.
+    let got = plan.decode(Vec::new(), &options)?.into_fixed()?;
     assert_eq!(got, vec![0u8; 4 * 4 * 2], "fill value");
+
+    // The into form leaves filling to `fill_absent_into`, which reads nothing.
+    let element_size = 2;
+    let mut output = vec![0xAAu8; 4 * 4 * element_size];
+    {
+        let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+        let mut view = unsafe {
+            ArrayBytesFixedDisjointView::new(
+                output_slice,
+                element_size,
+                &[4, 4],
+                ArraySubset::new_with_shape(vec![4, 4]),
+            )?
+        };
+        let before = store.reads();
+        plan.fill_absent_into(ArrayBytesDecodeIntoTarget::Fixed(&mut view), &options)?;
+        assert_eq!(store.reads(), before, "filling absent units reads nothing");
+    }
+    assert_eq!(output, vec![0u8; 4 * 4 * 2], "fill value");
 
     Ok(())
 }
@@ -491,7 +501,7 @@ fn fetched_bytes_must_match_the_plan() -> Result<(), Box<dyn Error>> {
             .expect("sharding reports its reads"),
     );
     assert!(
-        plan.byte_ranges().iter().all(Option::is_some),
+        plan.num_entries() > 0,
         "every inner chunk of this subset was written"
     );
 
@@ -684,12 +694,14 @@ fn an_out_of_bounds_selection_errors() -> Result<(), Box<dyn Error>> {
             "{chunk_indices:?}: unexpected error: {err}"
         );
 
-        // The same selection reaching the decode path as a hand-built plan.
+        // The same selection reaching the decode path as a hand-built plan. It is
+        // rejected as hand-built -- carrying no decoder-minted state -- before its
+        // bounds are ever looked at.
         let err = DataPlan::new(planned, oob.clone(), Vec::new())
             .decode(Vec::new(), &options)
             .expect_err("decoding an out-of-bounds plan must fail");
         assert!(
-            matches!(err, CodecError::IncompatibleIndexer(_)),
+            matches!(err, CodecError::ReadPlanMismatch),
             "{chunk_indices:?}: unexpected error: {err}"
         );
     }
@@ -716,13 +728,16 @@ fn a_nested_plan_names_the_subchunk_indexes_first() -> Result<(), Box<dyn Error>
         .expect("a nested selection is planned");
     assert_eq!(store.reads(), before, "planning must not perform any reads");
     let index_plan = expect_indexes(plan);
-    let index_entries = index_plan.num_entries();
     let index_reads = index_plan.reads().count();
+    assert!(index_reads > 0, "part-wanted subchunks have indexes to read");
 
     let fetched = fetch(&store, &key, index_plan.byte_ranges())?;
     let data_plan = index_plan.refine(fetched, &options)?;
     assert_eq!(store.reads(), before + index_reads);
-    assert!(data_plan.num_entries() >= index_entries);
+    assert!(
+        data_plan.num_entries() > 0,
+        "refining named the data itself"
+    );
 
     Ok(())
 }
@@ -904,6 +919,190 @@ fn wanting_whole_subchunks_needs_no_index_round() -> Result<(), Box<dyn Error>> 
             ReadPlan::Indexes(_)
         ),
         "part of a subchunk needs its index"
+    );
+
+    Ok(())
+}
+
+/// File-adjacent inner chunks coalesce into single reads, and decode to exactly
+/// what `partial_decode` returns.
+///
+/// The unit of a plan is a read: chunks written next to each other in the shard
+/// are one byte range, however many of them there are. Write order `C` makes
+/// grid-adjacent chunks file-adjacent, so the run structure here is exact.
+#[test]
+fn file_adjacent_chunks_coalesce_into_one_read() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build_ordered()?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let planned = planned_of(&decoder);
+
+    // Chunk rows 1..3 x columns 0..3: six chunks, file-adjacent in two row runs
+    // of three ([1,0][1,1][1,2] and [2,0][2,1][2,2]).
+    let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+    let plan = expect_data(
+        planned
+            .clone()
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
+    assert_eq!(
+        plan.num_entries(),
+        2,
+        "six chunks in two file-adjacent runs are two reads"
+    );
+
+    let got = plan
+        .decode(fetch(&store, &key, plan.byte_ranges())?, &options)?
+        .into_fixed()?;
+    let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+    assert_eq!(got, expected);
+
+    Ok(())
+}
+
+/// With no file adjacency, every run is one chunk and behaviour is identical to
+/// planning one read per chunk.
+///
+/// A column of a C-order-written shard is chunks four apart in the file, so
+/// nothing merges: the run structure degenerates to exactly the old plan.
+#[test]
+fn without_adjacency_every_run_is_one_chunk() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build_ordered()?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+
+    // Chunk column 0, all four rows: file positions 0, 4, 8, 12.
+    let subset = ArraySubset::new_with_ranges(&[0..8, 0..2]);
+    let plan = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
+    assert_eq!(plan.num_entries(), 4, "no adjacency, so one read per chunk");
+
+    let got = plan
+        .decode(fetch(&store, &key, plan.byte_ranges())?, &options)?
+        .into_fixed()?;
+    let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+    assert_eq!(got, expected);
+
+    Ok(())
+}
+
+/// A selection straddling stored and absent chunks: the reads cover only what is
+/// stored, `fill_absent_into` covers the rest, and together they equal
+/// `partial_decode`.
+#[test]
+fn absent_chunks_are_filled_not_read() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    // Store only the top half of the array: shard [0, 0]'s chunk rows 0..2 exist,
+    // rows 2..4 are absent.
+    let store = Arc::new(PerformanceMetricsStorageAdapter::new(Arc::new(
+        MemoryStore::default(),
+    )));
+    let data_type = data_type::uint16();
+    let codec = Arc::new(
+        ShardingCodecBuilder::new(vec![nz(2), nz(2)], &data_type)
+            .build()
+            .with_options(
+                ShardingCodecOptions::default().with_subchunk_write_order(SubchunkWriteOrder::C),
+            ),
+    );
+    let mut builder = ArrayBuilder::new(vec![16, 16], vec![8, 8], data_type, 0u16);
+    builder.array_to_bytes_codec(codec);
+    let array = builder.build_arc(store.clone(), "/array")?;
+    let top = ArraySubset::new_with_ranges(&[0..4, 0..16]);
+    array.store_array_subset(&top, (0..64u16).collect::<Vec<_>>())?;
+
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    // Rows 2..6: chunk row 1 is stored, chunk row 2 is absent.
+    let subset = ArraySubset::new_with_ranges(&[2..6, 0..4]);
+    let plan = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
+    assert!(
+        plan.num_entries() > 0,
+        "the stored chunk row is there to read"
+    );
+
+    let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+    let element_size = 2;
+    let mut output = vec![0xAAu8; 4 * 4 * element_size];
+    {
+        let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+        // `ArrayBytesDecodeIntoTarget` borrows the view for its whole lifetime, so
+        // each call gets a fresh view of the same output.
+        let view = || unsafe {
+            ArrayBytesFixedDisjointView::new(
+                output_slice,
+                element_size,
+                &[4, 4],
+                ArraySubset::new_with_shape(vec![4, 4]),
+            )
+        };
+        // Fill before any read returns -- it needs no fetched data.
+        let before = store.reads();
+        plan.fill_absent_into(ArrayBytesDecodeIntoTarget::Fixed(&mut view()?), &options)?;
+        assert_eq!(store.reads(), before, "filling absent units reads nothing");
+        plan.decode_into(
+            fetch(&store, &key, plan.byte_ranges())?,
+            ArrayBytesDecodeIntoTarget::Fixed(&mut view()?),
+            &options,
+        )?;
+    }
+    assert_eq!(output, expected.into_owned(), "fill + decode = the answer");
+
+    Ok(())
+}
+
+/// Only the decoder can mint a valid plan: hand-building one through the public
+/// constructor with the decoder's *own correct ranges* is still rejected.
+///
+/// The run structure -- which units each read holds, where each decodes to -- is
+/// trusted because it is provably the decoder's own work. A hand-built plan
+/// carries no such work, so there is nothing to trust, however right its ranges
+/// happen to be.
+#[test]
+fn a_plan_without_decoder_state_is_rejected() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(false)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let genuine = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
+    let hand_built = DataPlan::new(
+        planned_of(&decoder),
+        subset.clone(),
+        genuine.byte_ranges().to_vec(),
+    );
+
+    let fetched = fetch(&store, &key, hand_built.byte_ranges())?;
+    let err = hand_built
+        .decode(fetched, &options)
+        .expect_err("the ranges are right, but nothing proves the structure");
+    assert!(
+        matches!(err, CodecError::ReadPlanMismatch),
+        "unexpected error: {err}"
+    );
+
+    // The genuine plan, of course, still decodes.
+    let got = genuine
+        .decode(fetch(&store, &key, genuine.byte_ranges())?, &options)?
+        .into_fixed()?;
+    assert_eq!(
+        got,
+        decoder.partial_decode(&subset, &options)?.into_fixed()?
     );
 
     Ok(())
