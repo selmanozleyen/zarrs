@@ -1,13 +1,14 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use zarrs_chunk_grid::{ChunkGrid, Indexer};
 use zarrs_data_type::DataType;
 use zarrs_plugin::{MaybeSend, MaybeSync};
-use zarrs_storage::StorageError;
+use zarrs_storage::{MaybeBytes, StorageError};
 
 use crate::{
-    ArrayBytes, ArrayBytesDecodeIntoTarget, CodecError, CodecOptions, InvalidNumberOfElementsError,
-    decode_into_array_bytes_target,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, CodecError, CodecOptions, DataPlan, IndexPlan,
+    InvalidNumberOfElementsError, ReadPlan, decode_into_array_bytes_target,
 };
 
 /// Partial array decoder traits.
@@ -94,11 +95,214 @@ pub trait ArrayPartialDecoderTraits: Any + MaybeSend + MaybeSync {
         decode_into_array_bytes_target(&decoded_value, output_target)
     }
 
+    /// Return this decoder as one that can describe its reads, if it can.
+    ///
+    /// Most decoders cannot: only a format that already holds a map from array regions to
+    /// byte ranges, such as a shard index, can say where bytes live without reading them.
+    /// The default answers [`None`], so a decoder opts in by implementing
+    /// [`ArrayPartialDecoderPlanned`] and overriding this.
+    ///
+    /// Takes [`Arc<Self>`] because a plan holds the decoder that produced it -- see
+    /// [`ReadPlan`]. Answering [`Some`] means only that this decoder plans *some*
+    /// indexers; whether it can plan a particular one is
+    /// [`read_plan`](ArrayPartialDecoderPlanned::read_plan)'s answer, since that depends
+    /// on the selection.
+    fn into_planned(self: Arc<Self>) -> Option<Arc<dyn ArrayPartialDecoderPlanned>> {
+        None
+    }
+
     /// Returns whether this decoder supports partial decoding.
     ///
     /// If this returns `true`, the decoder can efficiently handle partial decoding operations.
     /// If this returns `false`, partial decoding will fall back to a full decode operation.
     fn supports_partial_decode(&self) -> bool;
+}
+
+/// A partial decoder that can describe its reads before performing them.
+///
+/// Separate from [`ArrayPartialDecoderTraits`] because almost nothing can do this, and a
+/// capability every implementor declines is not a capability the base trait should claim.
+/// Keeping the pair here also means they cannot be half-implemented: a decoder that hands
+/// out byte ranges must be able to decode the bytes that come back.
+///
+/// Reach it through [`into_planned`](ArrayPartialDecoderTraits::into_planned). Callers
+/// drive everything after [`read_plan`](Self::read_plan) through the plan itself --
+/// [`IndexPlan::refine`] and [`DataPlan::decode_into`] -- which hand the bytes back to
+/// the decoder the plan holds. The remaining methods here are those entry points'
+/// implementor side, not a caller surface.
+///
+/// Deliberately not a subtrait of [`ArrayPartialDecoderTraits`]: no method performs
+/// I/O, so nothing here is sync-specific, and an async decoder can implement this same
+/// trait rather than needing a duplicate of it.
+pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
+    /// Report the reads [`partial_decode`](ArrayPartialDecoderTraits::partial_decode) would
+    /// perform, without performing them.
+    ///
+    /// This lets a caller holding several decoders issue all of their reads together and
+    /// schedule them as a whole, rather than one decoder at a time. It is worthwhile when
+    /// a read costs far more than the decode it feeds, which is the usual case for a
+    /// sharded array on network or parallel storage.
+    ///
+    /// Planning performs no reads: it is computed from state the decoder already holds.
+    ///
+    /// ```text
+    /// let plan = decoder.read_plan(&subset, &options)?.unwrap();
+    /// let plan = match plan {
+    ///     ReadPlan::Data(plan) => plan,
+    ///     ReadPlan::Indexes(plan) => plan.refine(fetch(plan.reads()), &options)?,
+    /// };
+    /// plan.decode_into(fetch(plan.reads()), target, &options)?;
+    /// ```
+    ///
+    /// Returns [`None`] when *this indexer* cannot be planned even though the decoder
+    /// plans others -- use [`partial_decode`](ArrayPartialDecoderTraits::partial_decode)
+    /// then. A decoder should decline whenever it cannot reach the stored bytes or the
+    /// innermost data: a bytes-to-bytes codec applied outside it means its offsets name a
+    /// decoded stream rather than the stored value, and subchunks nested deeper than one
+    /// index exchange cannot be read minimally -- planning them as whole reads would
+    /// fetch far more than was asked, with nothing for the caller to notice.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if the indexer is invalid for this decoder.
+    fn read_plan(
+        self: Arc<Self>,
+        indexer: &dyn Indexer,
+        options: &CodecOptions,
+    ) -> Result<Option<ReadPlan>, CodecError>;
+
+    /// Implementor side of [`IndexPlan::refine`]: exchange fetched index bytes for the
+    /// plan of the data they locate.
+    ///
+    /// One exchange is the whole state machine, which the signature states: the result is
+    /// a [`DataPlan`], not another [`IndexPlan`]. An implementor whose format would need
+    /// a second round must decline to plan that selection in
+    /// [`read_plan`](Self::read_plan) instead.
+    ///
+    /// Performs no I/O. `plan` and `fetched` are checked exactly as
+    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes) checks its own.
+    ///
+    /// The default errors, for the decoders that only ever produce data plans.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder would
+    /// produce or `fetched` does not match it, or [`CodecError`] if a codec fails.
+    fn refine_index_plan(
+        self: Arc<Self>,
+        plan: IndexPlan,
+        fetched: Vec<MaybeBytes>,
+        options: &CodecOptions,
+    ) -> Result<DataPlan, CodecError> {
+        _ = (plan, fetched, options);
+        Err(CodecError::ReadPlanMismatch)
+    }
+
+    /// Implementor side of [`DataPlan::fill_absent_into`]: fill the parts of the output
+    /// whose units have nothing to read.
+    ///
+    /// Performs no I/O -- which units are absent is known from the state the plan was
+    /// built from. The implementation checks `plan` is one it minted, exactly as the
+    /// decode entry points do.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder
+    /// produced, or [`CodecError`] if the output is invalid for the plan's selection.
+    fn fill_absent_into(
+        &self,
+        plan: &DataPlan,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError>;
+
+    /// Implementor side of [`DataPlan::decode_entry_into`]: decode one entry's bytes
+    /// into the output.
+    ///
+    /// Validation must be per entry -- constant work, not a walk of the plan -- or a
+    /// caller decoding a plan one entry at a time pays quadratic validation for linear
+    /// decoding. The checks are the whole-plan ones narrowed to `entry`: the plan
+    /// carries state this decoder minted, `entry` is in bounds, the entry's range is the
+    /// state's, and `bytes` has the length that range asked for.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder
+    /// produced, `entry` is out of bounds, or `bytes` does not match the entry's read,
+    /// or [`CodecError`] if a codec fails.
+    fn partial_decode_entry_from_bytes_into(
+        &self,
+        plan: &DataPlan,
+        entry: usize,
+        bytes: MaybeBytes,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError>;
+
+    /// Implementor side of [`DataPlan::decode`]: partially decode a chunk from encoded
+    /// bytes the caller already fetched.
+    ///
+    /// `fetched` must correspond one-to-one, and in order, with `plan`. The selection comes
+    /// from the plan, so there is no second selection to keep matched to it. The call
+    /// performs no I/O.
+    ///
+    /// Entries are [`MaybeBytes`] -- exactly what a store hands back -- so the caller does
+    /// not have to convert or copy them to hand them over. Every entry is a read, so
+    /// [`None`] never matches the plan: a store answering [`None`] means the stored value
+    /// changed since planning, and the decode reports the mismatch rather than guessing.
+    ///
+    /// The implementation checks `plan` and `fetched` against the reads it planned: that
+    /// the plan carries state it minted itself, that the ranges are the state's, and that
+    /// the bytes supplied for each entry have the length its range asked for. A plan
+    /// built through the public constructors carries no such state and is rejected. The
+    /// implementation cannot check the *order* of `fetched`, since entries of equal
+    /// length are indistinguishable, so handing back bytes in plan order is the caller's
+    /// side of the contract.
+    ///
+    /// The result is complete: units with nothing to read decode to the fill value, as
+    /// [`fill_absent_into`](Self::fill_absent_into) would fill them.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder would
+    /// produce or `fetched` does not match it, [`CodecError::IncompatibleIndexer`] if the
+    /// plan's selection is invalid for this decoder, or [`CodecError`] if a codec fails.
+    fn partial_decode_from_bytes(
+        &self,
+        plan: &DataPlan,
+        fetched: Vec<MaybeBytes>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytes<'_>, CodecError>;
+
+    /// Implementor side of [`DataPlan::decode_into`]:
+    /// [`partial_decode_from_bytes`](Self::partial_decode_from_bytes) into a preallocated
+    /// output.
+    ///
+    /// A caller assembling one output from several decoders wants this rather than the
+    /// owned form, which has to allocate a buffer per call and copy it into place. The
+    /// default does exactly that; an implementor that can decode straight into
+    /// `output_target` should override it. (The default therefore also writes fill
+    /// values where an override would leave [`fill_absent_into`](Self::fill_absent_into)
+    /// to do it -- the same values, so a caller doing both stays correct either way.)
+    ///
+    /// # Errors
+    /// Returns [`InvalidNumberOfElementsError`] if the plan's selection and
+    /// `output_target` hold different numbers of elements,
+    /// [`CodecError::ExpectedFixedLengthBytes`] if `output_target` is a kind this decoder
+    /// does not plan, [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder
+    /// would produce or `fetched` does not match it, or [`CodecError`] if a codec fails.
+    fn partial_decode_from_bytes_into(
+        &self,
+        plan: &DataPlan,
+        fetched: Vec<MaybeBytes>,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        if plan.subset().num_elements() != output_target.num_elements() {
+            return Err(InvalidNumberOfElementsError::new(
+                plan.subset().num_elements(),
+                output_target.num_elements(),
+            )
+            .into());
+        }
+        let decoded = self.partial_decode_from_bytes(plan, fetched, options)?;
+        decode_into_array_bytes_target(&decoded, output_target)
+    }
 }
 
 /// Partial array encoder traits.

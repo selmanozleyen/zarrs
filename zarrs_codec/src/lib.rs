@@ -22,7 +22,9 @@ pub use array_bytes_fixed_disjoint_view::{
 
 mod codec_traits;
 pub use codec_traits::array::ArrayCodecTraits;
-pub use codec_traits::array_partial_sync::{ArrayPartialDecoderTraits, ArrayPartialEncoderTraits};
+pub use codec_traits::array_partial_sync::{
+    ArrayPartialDecoderPlanned, ArrayPartialDecoderTraits, ArrayPartialEncoderTraits,
+};
 pub use codec_traits::array_to_array::{
     ArrayToArrayCodecSubchunkingIdentityTraits, ArrayToArrayCodecSubchunkingTraits,
     ArrayToArrayCodecTraits, UnboundArrayToArrayCodecTraits,
@@ -43,6 +45,10 @@ pub use codec_traits::array_partial_async::{
 pub use codec_traits::bytes_partial_async::{
     AsyncBytesPartialDecoderTraits, AsyncBytesPartialEncoderTraits,
 };
+
+mod read_plan;
+pub use codec_traits::array_to_bytes::SubchunkGeometry;
+pub use read_plan::{DataPlan, IndexPlan, PlanState, ReadPlan};
 
 mod recommended_concurrency;
 pub use recommended_concurrency::RecommendedConcurrency;
@@ -679,6 +685,14 @@ pub enum CodecError {
     /// Codec create error.
     #[error(transparent)]
     CodecCreateError(#[from] CodecCreateError),
+    /// A [`ReadPlan`], or the bytes fetched for it, do not match the reads a decoder would
+    /// perform.
+    ///
+    /// The entry count, a byte range, or the length of the bytes supplied for one differs
+    /// from what this decoder would have read. Entries of equal length are
+    /// indistinguishable, so this does not detect bytes handed back out of order.
+    #[error("the read plan, or the bytes fetched for it, do not match this decoder's reads")]
+    ReadPlanMismatch,
 }
 
 impl From<zarrs_data_type::DataTypeCodecError> for CodecError {
