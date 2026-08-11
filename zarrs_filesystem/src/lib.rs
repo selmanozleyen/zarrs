@@ -66,9 +66,24 @@ fn bytes_aligned(size: usize) -> BytesMut {
 pub struct FilesystemStoreOptions {
     direct_io: bool,
     file_handle_cache_size: usize,
+    #[cfg(feature = "io_uring")]
+    io_uring: bool,
 }
 
 impl FilesystemStoreOptions {
+    /// Set whether scattered byte-range reads go through one `io_uring` rather
+    /// than a blocking `pread` per range (default: off).
+    ///
+    /// All of a call's ranges are submitted to the ring at once, so their I/O
+    /// is in flight together without a thread parked per outstanding read.
+    /// Linux only, and worthwhile only where the filesystem actually serves
+    /// concurrent reads -- measure before enabling.
+    #[cfg(feature = "io_uring")]
+    pub fn io_uring(&mut self, io_uring: bool) -> &mut Self {
+        self.io_uring = io_uring;
+        self
+    }
+
     /// Set whether or not to enable direct I/O. Needs support from the
     /// operating system (currently only Linux) and file system.
     pub fn direct_io(&mut self, direct_io: bool) -> &mut Self {
@@ -106,6 +121,10 @@ impl FilesystemStoreOptions {
 struct CachedFile {
     file: RandomAccessFile,
     size: u64,
+    /// The underlying descriptor, for the ring. Valid while `file` is: the
+    /// `RandomAccessFile` owns the `File` this was taken from.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    fd: std::os::unix::io::RawFd,
 }
 
 /// A synchronous file system store.
@@ -217,7 +236,7 @@ impl FilesystemStore {
             }
         }
 
-        let file = match RandomAccessFile::open(self.key_to_fspath(key)) {
+        let file = match std::fs::File::open(self.key_to_fspath(key)) {
             Ok(file) => file,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -226,9 +245,20 @@ impl FilesystemStore {
                 return Err(err.into());
             }
         };
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        let fd = {
+            use std::os::unix::io::AsRawFd;
+            file.as_raw_fd()
+        };
+        let file = RandomAccessFile::try_new(file)?;
         let size = positioned_io::Size::size(&file)?
             .ok_or_else(|| StorageError::Other("Could not determine file size".to_string()))?;
-        let handle = Arc::new(CachedFile { file, size });
+        let handle = Arc::new(CachedFile {
+            file,
+            size,
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            fd,
+        });
 
         if let Some(cache) = &self.handle_cache {
             cache.lock().unwrap().put(key.clone(), handle.clone());
@@ -414,6 +444,119 @@ impl FilesystemStore {
     }
 }
 
+/// Read every range through one `io_uring`.
+///
+/// All ranges are submitted before anything is reaped, so their I/O is in
+/// flight together from one thread -- the ring holds the concurrency that the
+/// `pread` path buys with a thread per outstanding read. Results come back in
+/// completion order and are placed by index, so the output order matches the
+/// input order regardless.
+///
+/// A short read is resubmitted for the remainder rather than trusted: the
+/// kernel may split large or page-boundary reads, and `read_exact_at` is the
+/// semantics the caller gets elsewhere.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+fn get_partial_many_uring(
+    fd: std::os::unix::io::RawFd,
+    file_size: u64,
+    byte_ranges: ByteRangeIterator<'_>,
+) -> Result<MaybeBytesIterator<'_>, StorageError> {
+    use io_uring::{opcode, types, IoUring};
+
+    // Resolve every range up front, exactly as the pread path does.
+    let mut reads = Vec::new();
+    for byte_range in byte_ranges {
+        let offset = match byte_range {
+            ByteRange::FromStart(offset, _) => offset,
+            ByteRange::Suffix(length) => file_size.saturating_sub(length),
+        };
+        let length = match byte_range {
+            ByteRange::FromStart(start, None) => file_size.checked_sub(start).ok_or_else(|| {
+                StorageError::from(InvalidByteRangeError::new(byte_range, file_size))
+            })?,
+            ByteRange::FromStart(_, Some(length)) | ByteRange::Suffix(length) => length,
+        };
+        reads.push((offset, usize::try_from(length).unwrap()));
+    }
+    if reads.is_empty() {
+        return Ok(Some(Box::new(std::iter::empty())));
+    }
+
+    let depth = reads.len().min(256);
+    let mut ring = IoUring::new(u32::try_from(depth.next_power_of_two()).unwrap())
+        .map_err(|err| StorageError::Other(format!("io_uring_setup: {err}")))?;
+
+    let mut buffers: Vec<Vec<u8>> = reads.iter().map(|(_, len)| vec![0u8; *len]).collect();
+    // How much of each buffer is already filled, for short-read continuation.
+    let mut filled = vec![0usize; reads.len()];
+    let fd = types::Fd(fd);
+
+    let mut next = 0usize;
+    let mut inflight = 0usize;
+    let mut done = 0usize;
+    let submit = |index: usize, ring: &mut IoUring, buffers: &mut [Vec<u8>], filled: &[usize]| {
+        let (offset, len) = reads[index];
+        let start = filled[index];
+        let sqe = opcode::Read::new(
+            fd,
+            // SAFETY: the buffer lives in `buffers` until the whole call
+            // returns, and a slot is only resubmitted after its completion.
+            unsafe { buffers[index].as_mut_ptr().add(start) },
+            u32::try_from(len - start).unwrap(),
+        )
+        .offset(offset + start as u64)
+        .build()
+        .user_data(index as u64);
+        // SAFETY: as above; the queue has room because inflight < depth.
+        unsafe { ring.submission().push(&sqe).expect("inflight < depth") };
+    };
+
+    while done < reads.len() {
+        while inflight < depth && next < reads.len() {
+            submit(next, &mut ring, &mut buffers, &filled);
+            next += 1;
+            inflight += 1;
+        }
+        ring.submit_and_wait(1)
+            .map_err(|err| StorageError::Other(format!("io_uring_enter: {err}")))?;
+        // Collected first: reaping while resubmitting would alias the ring.
+        let completions: Vec<(usize, i32)> = ring
+            .completion()
+            .map(|cqe| (usize::try_from(cqe.user_data()).unwrap(), cqe.result()))
+            .collect();
+        for (index, result) in completions {
+            inflight -= 1;
+            if result < 0 {
+                return Err(StorageError::from(std::io::Error::from_raw_os_error(
+                    -result,
+                )));
+            }
+            let got = usize::try_from(result).unwrap();
+            filled[index] += got;
+            let (_, len) = reads[index];
+            if filled[index] < len {
+                if got == 0 {
+                    return Err(StorageError::from(InvalidByteRangeError::new(
+                        ByteRange::FromStart(reads[index].0, Some(len as u64)),
+                        file_size,
+                    )));
+                }
+                // Short read: continue where it stopped.
+                submit(index, &mut ring, &mut buffers, &filled);
+                inflight += 1;
+            } else {
+                done += 1;
+            }
+        }
+    }
+
+    let out: Vec<Result<Bytes, StorageError>> = buffers
+        .into_iter()
+        .map(|buffer| Ok(Bytes::from(buffer)))
+        .collect();
+    Ok(Some(Box::new(out.into_iter())))
+}
+
 impl ReadableStorageTraits for FilesystemStore {
     fn get_partial_many<'a>(
         &'a self,
@@ -429,6 +572,11 @@ impl ReadableStorageTraits for FilesystemStore {
         let Some(handle) = self.open_or_cached(key)? else {
             return Ok(None);
         };
+
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        if self.options.io_uring {
+            return get_partial_many_uring(handle.fd, handle.size, byte_ranges);
+        }
         let file = &handle.file;
         let file_size = handle.size;
 

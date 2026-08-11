@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use zarrs_chunk_grid::ChunkGridCreateError;
 use zarrs_data_type::{DataType, FillValue};
+use zarrs_storage::byte_range::ByteRange;
 
 use crate::codec_partial_default::ArrayToBytesCodecPartialDefault;
 use crate::{
@@ -12,6 +13,57 @@ use crate::{
     CodecCreateError, CodecError, CodecOptions, CodecSpecificOptions, CodecTraits,
     decode_into_array_bytes_target,
 };
+
+/// What is needed to read one level of a codec's subchunks.
+///
+/// Produced by
+/// [`subchunk_geometry`](ArrayToBytesCodecSubchunkingTraits::subchunk_geometry). All of it
+/// comes from immutable configuration, so it is the same for every chunk of an array and
+/// worth resolving once.
+#[derive(Debug)]
+pub struct SubchunkGeometry {
+    index_within: ByteRange,
+    shape: Vec<NonZeroU64>,
+    codecs: Arc<dyn ArrayToBytesCodecTraits>,
+}
+
+impl SubchunkGeometry {
+    /// Create a subchunk geometry, for implementors of
+    /// [`ArrayToBytesCodecSubchunkingTraits`].
+    #[must_use]
+    pub fn new(
+        index_within: ByteRange,
+        shape: Vec<NonZeroU64>,
+        codecs: Arc<dyn ArrayToBytesCodecTraits>,
+    ) -> Self {
+        Self {
+            index_within,
+            shape,
+            codecs,
+        }
+    }
+
+    /// Where a subchunk's own index sits within that subchunk.
+    ///
+    /// A [`Suffix`](ByteRange::Suffix) counts from the subchunk's end, not the stored
+    /// value's, so making it absolute takes the subchunk's length.
+    #[must_use]
+    pub const fn index_within(&self) -> ByteRange {
+        self.index_within
+    }
+
+    /// The shape of the chunks that index locates.
+    #[must_use]
+    pub fn shape(&self) -> &[NonZeroU64] {
+        &self.shape
+    }
+
+    /// The codecs that decode one of those chunks from its encoded bytes.
+    #[must_use]
+    pub fn codecs(&self) -> &Arc<dyn ArrayToBytesCodecTraits> {
+        &self.codecs
+    }
+}
 
 /// Subchunking traits for an array-to-bytes codec bound to a data type and fill value.
 pub trait ArrayToBytesCodecSubchunkingTraits: ArrayCodecTraits {
@@ -28,6 +80,43 @@ pub trait ArrayToBytesCodecSubchunkingTraits: ArrayCodecTraits {
         &self,
         decoded_chunk_grid: ChunkGridDecodedRef<'_>,
     ) -> Result<Vec<ChunkGridDecoded>, ChunkGridCreateError>;
+
+    /// What is needed to read one level of this codec's subchunks, if it has any.
+    ///
+    /// Answered from metadata, without reading anything: an index of this kind has a fixed
+    /// encoded size at a known place within the encoded chunk. That is what makes a subchunk
+    /// plannable -- a caller can be told where a subchunk's index lives before anything has
+    /// been read, including for a subchunk nested inside a subchunk.
+    ///
+    /// [`None`] when the codec has no such index, when its size is not fixed, or when
+    /// `decoded_shape` is not one it supports. Defaulting to [`None`] means a codec opts in.
+    ///
+    /// Implementors should memoise this. It is a function of immutable configuration, and a
+    /// caller may ask once per chunk of an array.
+    fn subchunk_geometry(&self, decoded_shape: &[NonZeroU64]) -> Option<Arc<SubchunkGeometry>> {
+        _ = decoded_shape;
+        None
+    }
+
+    /// Decode the index located by [`subchunk_geometry`](Self::subchunk_geometry).
+    ///
+    /// Pairs offset and length for each subchunk, in the codec's own subchunk order, with
+    /// `u64::MAX` in both for a subchunk that is not stored. There are `2 * subchunks`
+    /// entries; a caller may rely on that.
+    ///
+    /// [`None`] is returned by a codec with no such index.
+    ///
+    /// # Errors
+    /// Returns [`CodecError`] if `encoded` is not a valid index for `decoded_shape`.
+    fn decode_subchunk_index(
+        &self,
+        decoded_shape: &[NonZeroU64],
+        encoded: &[u8],
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<u64>>, CodecError> {
+        _ = (decoded_shape, encoded, options);
+        Ok(None)
+    }
 
     /// Return the outermost decoded subchunk grid created by this codec.
     ///

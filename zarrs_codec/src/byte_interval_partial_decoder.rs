@@ -65,6 +65,15 @@ impl BytesPartialDecoderTraits for ByteIntervalPartialDecoder {
     fn supports_partial_decode(&self) -> bool {
         self.input_handle.supports_partial_decode()
     }
+
+    fn stored_offset_base(&self) -> Option<ByteOffset> {
+        // An interval of something that is part of the stored value is itself part of it,
+        // starting this much further in. This is what lets an inner shard's plan be
+        // expressed in the same coordinates as its enclosing shard's.
+        self.input_handle
+            .stored_offset_base()
+            .map(|base| base + self.byte_offset)
+    }
 }
 
 #[cfg(feature = "async")]
