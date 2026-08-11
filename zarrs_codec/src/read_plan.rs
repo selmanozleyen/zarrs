@@ -231,6 +231,10 @@ impl DataPlan {
     /// nothing to read are [`fill_absent_into`](Self::fill_absent_into)'s, called once
     /// by the caller. Performs no I/O.
     ///
+    /// For callers that already hold every entry's bytes. A caller receiving them as
+    /// reads complete wants [`decode_entry_into`](Self::decode_entry_into) instead,
+    /// which this is a loop over.
+    ///
     /// # Errors
     /// Returns [`CodecError::ReadPlanMismatch`] if the plan or `fetched` do not match the
     /// reads the decoder would perform, or [`CodecError`] if a codec fails.
@@ -242,6 +246,35 @@ impl DataPlan {
     ) -> Result<(), CodecError> {
         self.decoder
             .partial_decode_from_bytes_into(self, fetched, output_target, options)
+    }
+
+    /// Decode one entry's bytes into a preallocated output, as its read lands.
+    ///
+    /// The per-read counterpart of [`decode_into`](Self::decode_into): entries are
+    /// independent -- each decodes into its own disjoint subdivision of the output -- so
+    /// nothing requires a chunk's reads to all be back before any of them decodes.
+    /// Waiting gates every entry's decode on the chunk's slowest read and holds every
+    /// fetched buffer until the last one lands; this releases each as it is consumed.
+    ///
+    /// `bytes` is what the store returned for `plan.byte_ranges()[entry]`. Distinct
+    /// entries may decode concurrently into views of the same output, since they write
+    /// disjoint subdivisions of it; the caller owns that dispatch, and the threading it
+    /// implies. Validation is per entry -- constant work, so decoding a plan one entry
+    /// at a time costs what decoding it whole does. Performs no I/O.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if the plan is not one this decoder
+    /// produced, `entry` is out of bounds, or `bytes` does not match the entry's read,
+    /// or [`CodecError`] if a codec fails.
+    pub fn decode_entry_into(
+        &self,
+        entry: usize,
+        bytes: MaybeBytes,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        self.decoder
+            .partial_decode_entry_from_bytes_into(self, entry, bytes, output_target, options)
     }
 
     /// Decode the fetched bytes into freshly allocated array bytes.

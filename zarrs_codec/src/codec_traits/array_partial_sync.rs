@@ -213,6 +213,28 @@ pub trait ArrayPartialDecoderPlanned: Any + MaybeSend + MaybeSync {
         options: &CodecOptions,
     ) -> Result<(), CodecError>;
 
+    /// Implementor side of [`DataPlan::decode_entry_into`]: decode one entry's bytes
+    /// into the output.
+    ///
+    /// Validation must be per entry -- constant work, not a walk of the plan -- or a
+    /// caller decoding a plan one entry at a time pays quadratic validation for linear
+    /// decoding. The checks are the whole-plan ones narrowed to `entry`: the plan
+    /// carries state this decoder minted, `entry` is in bounds, the entry's range is the
+    /// state's, and `bytes` has the length that range asked for.
+    ///
+    /// # Errors
+    /// Returns [`CodecError::ReadPlanMismatch`] if `plan` is not one this decoder
+    /// produced, `entry` is out of bounds, or `bytes` does not match the entry's read,
+    /// or [`CodecError`] if a codec fails.
+    fn partial_decode_entry_from_bytes_into(
+        &self,
+        plan: &DataPlan,
+        entry: usize,
+        bytes: MaybeBytes,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError>;
+
     /// Implementor side of [`DataPlan::decode`]: partially decode a chunk from encoded
     /// bytes the caller already fetched.
     ///

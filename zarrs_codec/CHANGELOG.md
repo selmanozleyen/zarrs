@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Add `ReadPlan`, which carries the selection its byte ranges were computed for, and `CodecError::ReadPlanMismatch`
   - A plan's unit is a read: one entry may cover several stored units that are adjacent in the stored value, and absent units are not entries -- `DataPlan::fill_absent_into` fills them without fetched data
   - Add `PlanState`, decoder-private state carried by plans built with `{Data,Index}Plan::new_with_state`; only plans the decoder minted validate, so decoding never re-derives the walk
+  - Add `DataPlan::decode_entry_into` to decode one entry as its read lands, with per-entry (constant-work) validation; `decode_into` remains for callers that already hold everything
 - Implement `BytesPartialDecoderTraits` for `Bytes`, so bytes a store returned can be decoded without being copied into a `Vec` first
 
 ### Changed
