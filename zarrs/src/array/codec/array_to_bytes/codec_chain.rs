@@ -456,6 +456,33 @@ impl UnboundArrayToBytesCodecTraits for CodecChain {
 }
 
 impl zarrs_codec::ArrayToBytesCodecSubchunkingTraits for CodecChainBound {
+    fn subchunk_geometry(
+        &self,
+        decoded_shape: &[NonZeroU64],
+    ) -> Option<Arc<zarrs_codec::SubchunkGeometry>> {
+        // Only the bare codec can answer. An array-to-array codec changes what
+        // `decoded_shape` describes, and a bytes-to-bytes codec moves the index somewhere
+        // else in the encoded chunk -- in both cases a range from the inner codec would
+        // name the wrong bytes.
+        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
+            return None;
+        }
+        self.array_to_bytes.subchunk_geometry(decoded_shape)
+    }
+
+    fn decode_subchunk_index(
+        &self,
+        decoded_shape: &[NonZeroU64],
+        encoded: &[u8],
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<u64>>, CodecError> {
+        if !self.array_to_array.is_empty() || !self.bytes_to_bytes.is_empty() {
+            return Ok(None);
+        }
+        self.array_to_bytes
+            .decode_subchunk_index(decoded_shape, encoded, options)
+    }
+
     fn decoded_subchunk_grids(
         &self,
         decoded_chunk_grid: ChunkGridDecodedRef<'_>,

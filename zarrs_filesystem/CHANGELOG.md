@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/zarrs/zarrs/compare/zarrs_filesystem-v0.3.12...HEAD)
 
+### Added
+- Add an `io_uring` feature: scattered byte-range reads through one ring instead of a `pread` per range, opt-in per store via `FilesystemStoreOptions::io_uring` (Linux only)
+
 ### Changed
 - **Behavioural change**: `FilesystemStore` no longer serialises operations on the same key
   - A read of a key concurrent with a write of that key is now undefined, which is aligned with the `zarrs` store expectations

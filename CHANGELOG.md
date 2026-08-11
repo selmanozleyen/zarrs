@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased](https://github.com/zarrs/zarrs/compare/zarrs-v0.23.13...HEAD)
 
 ### Added
+- Add `ArrayPartialDecoderPlanned::{read_plan,partial_decode_from_bytes,partial_decode_from_bytes_into}` and `ArrayPartialDecoderTraits::as_planned` so a caller can collect the reads of several decoders, issue them together, and hand the bytes back
+  - Implemented by the `sharding_indexed` partial decoder for fixed-size array subsets; other decoders report no plan and are unaffected
+  - Add `ReadPlan`, which carries the selection its byte ranges were computed for so a plan cannot be paired with a different one, and `CodecError::ReadPlanMismatch`
+  - Sync only for now. The reads are the caller's to issue, so the benefit is in how the caller schedules them; an async counterpart can reuse `ReadPlan` and the geometry unchanged
+- Add `ShardingCodecOptions::subchunk_decoder_cache` (default enabled), which keeps inner-chunk partial decoders for the lifetime of a shard's partial decoder
+  - Only has an effect when inner chunks are themselves shards, where building a decoder reads that inner shard's own index
 - Add the `cast_value` array-to-array codec
 - Implement `Default` for `MetadataRetrieveVersion`
 - Add `GroupOpenOptions` and `Group::new_with_metadata_opt`
@@ -53,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking**: Refactor `ChunkCache` trait to a pure key/chunk value container:
   - **Breaking**: Remove `retrieve_*` methods, these are handled by `ArrayCached` instead
   - **Breaking**: Change `ChunkCacheTypeDecoded` to an `Option`
-  - `try_get_or_insert_with` is no longer `#[doc(hidden)]`
   - Add `invalidate` methods
 - Clarify in the `Array` *Parallel Writing* documentation that a chunk must not be retrieved while it is being written, not just that it must not be written concurrently
   - This has always been the case, but was only explicitly stated for concurrent writes

@@ -4,10 +4,10 @@ use std::sync::Mutex;
 
 use zarrs_plugin::{MaybeSend, MaybeSync};
 use zarrs_storage::byte_range::{
-    ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges,
+    ByteOffset, ByteRange, ByteRangeIterator, InvalidByteRangeError, extract_byte_ranges_ref,
 };
 use zarrs_storage::{
-    OffsetBytesIterator, ReadableStorageTraits, ReadableWritableStorageTraits, StorageError,
+    Bytes, OffsetBytesIterator, ReadableStorageTraits, ReadableWritableStorageTraits, StorageError,
     StoreKey,
 };
 
@@ -69,6 +69,26 @@ pub trait BytesPartialDecoderTraits: Any + MaybeSend + MaybeSync {
     /// If this returns `true`, the decoder can efficiently handle partial decoding operations.
     /// If this returns `false`, partial decoding will fall back to a full decode operation.
     fn supports_partial_decode(&self) -> bool;
+
+    /// Where this decoder's bytes begin within the stored value, if they are part of it.
+    ///
+    /// A byte range can only be reported to a caller who will fetch it themselves --
+    /// what [`ArrayPartialDecoderPlanned`](crate::ArrayPartialDecoderPlanned) does -- if
+    /// it can be expressed in the store's coordinates. This says how: a range at offset
+    /// `o` here is at `base + o` in the stored value.
+    ///
+    /// A decoder that transforms the bytes it sits on -- decompressing them, or stripping
+    /// a prefix -- has no such base, because its offsets are in its own coordinates and a
+    /// caller issuing them against the store would read the wrong bytes with nothing to
+    /// notice it by. Those answer [`None`], which is the default.
+    ///
+    /// A base rather than a yes/no so that handles compose: a decoder over a byte interval
+    /// of the stored value can report the interval's own start added to whatever its input
+    /// reports, which is what makes a plan for a shard nested inside a shard expressible
+    /// in the same coordinates as one for the shard itself.
+    fn stored_offset_base(&self) -> Option<ByteOffset> {
+        None
+    }
 }
 
 /// Partial bytes encoder traits.
@@ -126,9 +146,37 @@ impl BytesPartialDecoderTraits for Cow<'static, [u8]> {
         _parallel: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
         Ok(Some(
-            extract_byte_ranges(self, decoded_regions)?
+            extract_byte_ranges_ref(self, decoded_regions)?
                 .into_iter()
-                .map(Cow::Owned)
+                .map(Cow::Borrowed)
+                .collect(),
+        ))
+    }
+
+    fn supports_partial_decode(&self) -> bool {
+        true
+    }
+}
+
+/// Decode from bytes a store already handed back, without copying them first.
+impl BytesPartialDecoderTraits for Bytes {
+    fn exists(&self) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
+    fn size_held(&self) -> usize {
+        self.len()
+    }
+
+    fn partial_decode_many(
+        &self,
+        decoded_regions: ByteRangeIterator,
+        _parallel: &CodecOptions,
+    ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
+        Ok(Some(
+            extract_byte_ranges_ref(self, decoded_regions)?
+                .into_iter()
+                .map(Cow::Borrowed)
                 .collect(),
         ))
     }
@@ -153,9 +201,9 @@ impl BytesPartialDecoderTraits for Vec<u8> {
         _parallel: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
         Ok(Some(
-            extract_byte_ranges(self, decoded_regions)?
+            extract_byte_ranges_ref(self, decoded_regions)?
                 .into_iter()
-                .map(Cow::Owned)
+                .map(Cow::Borrowed)
                 .collect(),
         ))
     }
@@ -259,6 +307,11 @@ impl<TStorage: ReadableStorageTraits + 'static> BytesPartialDecoderTraits for (T
 
     fn supports_partial_decode(&self) -> bool {
         self.0.supports_get_partial()
+    }
+
+    fn stored_offset_base(&self) -> Option<ByteOffset> {
+        // This decoder *is* the stored value.
+        Some(0)
     }
 }
 

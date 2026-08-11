@@ -312,3 +312,48 @@ fn direct_io_coalescing_test() -> Result<(), Box<dyn Error>> {
     });
     Ok(())
 }
+
+/// The uring path returns byte-identical results to the pread path, in input
+/// order, across range shapes -- including suffixes, unbounded tails, and
+/// enough ranges to exceed the ring and force refills.
+#[test]
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+fn filesystem_io_uring_matches_pread() -> Result<(), Box<dyn Error>> {
+    use zarrs_storage::byte_range::ByteRange;
+
+    let path = tempfile::TempDir::new()?;
+    let value: Vec<u8> = (0..100_000u32).flat_map(u32::to_le_bytes).collect();
+    let key = StoreKey::new("a/b")?;
+
+    let mut options = FilesystemStoreOptions::default();
+    options.io_uring(true);
+    let uring = FilesystemStore::new_with_options(path.path(), options.clone())?;
+    let plain = FilesystemStore::new_with_options(path.path(), FilesystemStoreOptions::default())?;
+    plain.set(&key, Bytes::from(value))?;
+
+    let mut ranges: Vec<ByteRange> = (0..300u64)
+        .map(|i| ByteRange::FromStart(i * 1301, Some(997)))
+        .collect();
+    ranges.push(ByteRange::Suffix(1234));
+    ranges.push(ByteRange::FromStart(399_000, None));
+    ranges.push(ByteRange::FromStart(0, Some(0)));
+
+    let got: Vec<_> = uring
+        .get_partial_many(&key, Box::new(ranges.clone().into_iter()))?
+        .expect("key exists")
+        .collect::<Result<_, _>>()?;
+    let want: Vec<_> = plain
+        .get_partial_many(&key, Box::new(ranges.into_iter()))?
+        .expect("key exists")
+        .collect::<Result<_, _>>()?;
+    assert_eq!(got, want);
+
+    // A missing key answers None, not an error.
+    assert!(uring
+        .get_partial_many(
+            &StoreKey::new("missing")?,
+            Box::new(std::iter::once(ByteRange::FromStart(0, Some(1))))
+        )?
+        .is_none());
+    Ok(())
+}
