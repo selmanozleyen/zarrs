@@ -787,6 +787,44 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         self.fill_absent_units(absent, plan.subset(), output_view)
     }
 
+    fn partial_decode_entry_from_bytes_into(
+        &self,
+        plan: &DataPlan,
+        entry: usize,
+        bytes: MaybeBytes,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        // Checked in the same order as the whole-plan entry point, narrowed to `entry`:
+        // everything here is constant work, so a plan decoded one entry at a time pays
+        // what decoding it whole pays.
+        if plan.subset().num_elements() != output_target.num_elements() {
+            return Err(InvalidNumberOfElementsError::new(
+                plan.subset().num_elements(),
+                output_target.num_elements(),
+            )
+            .into());
+        }
+        let ArrayBytesDecodeIntoTarget::Fixed(output_view) = output_target else {
+            return Err(ExpectedFixedLengthBytesError.into());
+        };
+        let state = self.minted_state(plan.subset(), plan.state(), plan.num_entries())?;
+        let PlanStage::Data { runs, .. } = &state.stage else {
+            return Err(CodecError::ReadPlanMismatch);
+        };
+        let run = runs.get(entry).ok_or(CodecError::ReadPlanMismatch)?;
+        // This entry's slice of the checks `verified_state` and `check_fetched_lengths`
+        // make across the plan.
+        if plan.byte_ranges().get(entry) != Some(&run.range()) {
+            return Err(CodecError::ReadPlanMismatch);
+        }
+        let bytes = bytes.ok_or(CodecError::ReadPlanMismatch)?;
+        if bytes.len() != usize::try_from(run.length).unwrap_or(usize::MAX) {
+            return Err(CodecError::ReadPlanMismatch);
+        }
+        self.decode_run_into(run, plan.subset(), &bytes, options, output_view)
+    }
+
     fn partial_decode_from_bytes(
         &self,
         plan: &DataPlan,
@@ -869,6 +907,23 @@ fn check_fetched_lengths(runs: &[Run], fetched: &[MaybeBytes]) -> Result<(), Cod
     Ok(())
 }
 
+/// The members of one fetched run, each with its slice of the run's bytes.
+///
+/// `Bytes` is a handle, so slicing shares the fetched buffer rather than copying it.
+/// `bytes` has already been checked to have the run's length.
+fn run_member_slices<'a>(run: &'a Run, bytes: &Bytes) -> Vec<(&'a RunMember, Bytes)> {
+    run.members
+        .iter()
+        .map(|member| {
+            // In-range: the members subdivide the run, and `bytes` has its length.
+            let start = usize::try_from(member.offset).expect("member within fetched run");
+            let end =
+                usize::try_from(member.offset + member.length).expect("member within fetched run");
+            (member, bytes.slice(start..end))
+        })
+        .collect()
+}
+
 impl ShardingPartialDecoder {
     /// The plan's state, if it is state this decoder minted and the plan is unaltered.
     ///
@@ -891,6 +946,25 @@ impl ShardingPartialDecoder {
         state: Option<&'a dyn PlanState>,
         byte_ranges: &[ByteRange],
     ) -> Result<&'a ShardingPlanState, CodecError> {
+        let state = self.minted_state(subset, state, byte_ranges.len())?;
+        if izip!(byte_ranges, state.runs()).any(|(range, run)| *range != run.range()) {
+            return Err(CodecError::ReadPlanMismatch);
+        }
+        Ok(state)
+    }
+
+    /// The constant-work core of [`verified_state`](Self::verified_state): everything
+    /// except the walk over the ranges.
+    ///
+    /// The per-entry decode path validates through this plus its own entry's range, so
+    /// that validating stays proportional to what is being decoded -- a plan decoded one
+    /// entry at a time must not pay a full-plan check per entry.
+    fn minted_state<'a>(
+        &self,
+        subset: &ArraySubset,
+        state: Option<&'a dyn PlanState>,
+        num_entries: usize,
+    ) -> Result<&'a ShardingPlanState, CodecError> {
         let state = state
             .and_then(|state| state.as_any().downcast_ref::<ShardingPlanState>())
             .ok_or(CodecError::ReadPlanMismatch)?;
@@ -900,12 +974,7 @@ impl ShardingPartialDecoder {
             // The plan itself keeps its decoder alive, so if this state was minted by
             // the decoder now consuming it, the upgrade cannot fail.
             .is_some_and(|minter| std::ptr::eq(Arc::as_ptr(&minter), self));
-        let runs = state.runs();
-        if !minted_here
-            || state.subset != *subset
-            || byte_ranges.len() != runs.len()
-            || izip!(byte_ranges, runs).any(|(range, run)| *range != run.range())
-        {
+        if !minted_here || state.subset != *subset || num_entries != state.runs().len() {
             return Err(CodecError::ReadPlanMismatch);
         }
         Ok(state)
@@ -984,6 +1053,38 @@ impl ShardingPartialDecoder {
         options: &CodecOptions,
         output_view: &mut ArrayBytesFixedDisjointView<'_>,
     ) -> Result<(), CodecError> {
+        let members: Vec<(&RunMember, Bytes)> = izip!(runs, fetched)
+            .flat_map(|(run, bytes)| {
+                run_member_slices(run, &bytes.expect("checked against the run"))
+            })
+            .collect();
+        self.decode_members_into(members, subset, options, output_view)
+    }
+
+    /// Decode one fetched run into a view of the output.
+    ///
+    /// `bytes` has already been checked against the run. The run's members are as
+    /// concurrent here as they are in the whole-plan path; what the per-entry path gives
+    /// up is only concurrency *across* entries, which its caller owns.
+    fn decode_run_into(
+        &self,
+        run: &Run,
+        subset: &ArraySubset,
+        bytes: &Bytes,
+        options: &CodecOptions,
+        output_view: &mut ArrayBytesFixedDisjointView<'_>,
+    ) -> Result<(), CodecError> {
+        self.decode_members_into(run_member_slices(run, bytes), subset, options, output_view)
+    }
+
+    /// Decode members into their disjoint subdivisions of the output.
+    fn decode_members_into(
+        &self,
+        members: Vec<(&RunMember, Bytes)>,
+        subset: &ArraySubset,
+        options: &CodecOptions,
+        output_view: &mut ArrayBytesFixedDisjointView<'_>,
+    ) -> Result<(), CodecError> {
         let chunks_per_shard =
             calculate_chunks_per_shard(&self.shard_shape, &self.subchunk_shape)?.to_array_shape();
         let (concurrent_limit, options) = super::get_concurrent_target_and_codec_options(
@@ -992,22 +1093,6 @@ impl ShardingPartialDecoder {
             &chunks_per_shard,
             options,
         )?;
-
-        // A member decodes from its slice of the run's bytes: `Bytes` is a handle, so
-        // slicing shares the fetched buffer rather than copying it.
-        let members: Vec<(&RunMember, Bytes)> = izip!(runs, fetched)
-            .flat_map(|(run, bytes)| {
-                let bytes = bytes.expect("checked against the run");
-                run.members.iter().map(move |member| {
-                    // In-range: the members subdivide the run, and `bytes` has its length.
-                    let start =
-                        usize::try_from(member.offset).expect("member within fetched run");
-                    let end = usize::try_from(member.offset + member.length)
-                        .expect("member within fetched run");
-                    (member, bytes.slice(start..end))
-                })
-            })
-            .collect();
 
         let geometry = self.nested_geometry();
         let decode_member = |(member, encoded): (&RunMember, Bytes)| {

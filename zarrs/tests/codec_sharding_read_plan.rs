@@ -1108,6 +1108,181 @@ fn a_plan_without_decoder_state_is_rejected() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Each entry decodes as its read lands: per-entry decodes in any order, plus one
+/// absent fill, equal `partial_decode` -- and read nothing.
+///
+/// Entries are independent, so nothing requires a chunk's reads to all be back
+/// before any of them decodes. Reverse order is the arbitrary-arrival stand-in.
+#[test]
+fn entries_decode_one_at_a_time_in_any_order() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    for (array, store) in [build(false)?, build_ordered()?] {
+        let key: StoreKey = array.chunk_key(&[0, 0]);
+        let decoder = array.partial_decoder(&[0, 0])?;
+        let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+        let plan = expect_data(
+            planned_of(&decoder)
+                .read_plan(&subset, &options)?
+                .expect("sharding reports its reads"),
+        );
+        let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+
+        let element_size = 2;
+        let mut output = vec![0xAAu8; 4 * 4 * element_size];
+        {
+            let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+            let view = || unsafe {
+                ArrayBytesFixedDisjointView::new(
+                    output_slice,
+                    element_size,
+                    &[4, 4],
+                    ArraySubset::new_with_shape(vec![4, 4]),
+                )
+            };
+            plan.fill_absent_into(ArrayBytesDecodeIntoTarget::Fixed(&mut view()?), &options)?;
+            let fetched = fetch(&store, &key, plan.byte_ranges())?;
+            let before = store.reads();
+            for (entry, bytes) in fetched.into_iter().enumerate().rev() {
+                plan.decode_entry_into(
+                    entry,
+                    bytes,
+                    ArrayBytesDecodeIntoTarget::Fixed(&mut view()?),
+                    &options,
+                )?;
+            }
+            assert_eq!(
+                store.reads(),
+                before,
+                "per-entry decoding must not touch storage"
+            );
+        }
+        assert_eq!(output, expected.into_owned());
+    }
+    Ok(())
+}
+
+/// A per-entry decode is checked exactly as strictly as the whole-plan one,
+/// narrowed to its entry.
+#[test]
+fn a_per_entry_decode_rejects_what_does_not_match() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(false)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let subset = ArraySubset::new_with_ranges(&[2..6, 1..5]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+    let plan = expect_data(
+        planned_of(&decoder)
+            .read_plan(&subset, &options)?
+            .expect("sharding reports its reads"),
+    );
+    let fetched = fetch(&store, &key, plan.byte_ranges())?;
+
+    let element_size = 2;
+    let mut output = vec![0u8; 4 * 4 * element_size];
+    let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+    let view = || unsafe {
+        ArrayBytesFixedDisjointView::new(
+            output_slice,
+            element_size,
+            &[4, 4],
+            ArraySubset::new_with_shape(vec![4, 4]),
+        )
+    };
+
+    let reject = |entry, bytes: MaybeBytes, what: &str| {
+        let err = plan
+            .decode_entry_into(
+                entry,
+                bytes,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view().unwrap()),
+                &options,
+            )
+            .expect_err(what);
+        assert!(
+            matches!(err, CodecError::ReadPlanMismatch),
+            "{what}: unexpected error: {err}"
+        );
+    };
+
+    reject(plan.num_entries(), fetched[0].clone(), "entry out of bounds");
+    reject(0, None, "nothing supplied for a read");
+    let short = fetched[0].as_ref().expect("stored").slice(1..);
+    reject(0, Some(short), "bytes of the wrong length");
+
+    // A hand-built plan has no per-entry path either.
+    let hand_built = DataPlan::new(
+        planned_of(&decoder),
+        subset.clone(),
+        plan.byte_ranges().to_vec(),
+    );
+    let err = hand_built
+        .decode_entry_into(
+            0,
+            fetched[0].clone(),
+            ArrayBytesDecodeIntoTarget::Fixed(&mut view()?),
+            &options,
+        )
+        .expect_err("no decoder-minted state, so nothing to trust");
+    assert!(matches!(err, CodecError::ReadPlanMismatch));
+
+    Ok(())
+}
+
+/// The nested path decodes per entry too: refine, then decode each read as it
+/// lands, against the ordinary decode's answer.
+#[test]
+fn nested_entries_decode_one_at_a_time() -> Result<(), Box<dyn Error>> {
+    let options = CodecOptions::default();
+    let (array, store) = build(true)?;
+    let key: StoreKey = array.chunk_key(&[0, 0]);
+    let decoder = array.partial_decoder(&[0, 0])?;
+
+    // Straddles subchunks wanted in part and whole, so the refined plan mixes
+    // innermost chunks with whole subchunks.
+    let subset = ArraySubset::new_with_ranges(&[2..8, 1..8]);
+    let plan = match planned_of(&decoder)
+        .read_plan(&subset, &options)?
+        .expect("a nested selection is planned")
+    {
+        ReadPlan::Data(plan) => plan,
+        ReadPlan::Indexes(plan) => {
+            let fetched = fetch(&store, &key, plan.byte_ranges())?;
+            plan.refine(fetched, &options)?
+        }
+    };
+    let expected = decoder.partial_decode(&subset, &options)?.into_fixed()?;
+
+    let element_size = 2;
+    let mut output = vec![0xAAu8; 6 * 7 * element_size];
+    {
+        let output_slice = UnsafeCellSlice::new(output.as_mut_slice());
+        let view = || unsafe {
+            ArrayBytesFixedDisjointView::new(
+                output_slice,
+                element_size,
+                &[6, 7],
+                ArraySubset::new_with_shape(vec![6, 7]),
+            )
+        };
+        plan.fill_absent_into(ArrayBytesDecodeIntoTarget::Fixed(&mut view()?), &options)?;
+        for (entry, bytes) in fetch(&store, &key, plan.byte_ranges())?
+            .into_iter()
+            .enumerate()
+            .rev()
+        {
+            plan.decode_entry_into(
+                entry,
+                bytes,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut view()?),
+                &options,
+            )?;
+        }
+    }
+    assert_eq!(output, expected.into_owned());
+
+    Ok(())
+}
+
 /// Nesting deeper than one exchange declines part-wanted selections instead of
 /// planning them badly.
 ///

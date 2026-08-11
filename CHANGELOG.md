@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Add `ReadPlan`, which carries the selection its byte ranges were computed for so a plan cannot be paired with a different one, and `CodecError::ReadPlanMismatch`
   - A plan's unit is a read: inner chunks adjacent in the shard file coalesce into one byte range, absent chunks are not entries, and `DataPlan::fill_absent_into` fills them without fetched data
   - Plans carry decoder-private state (`PlanState`) minted at planning; a hand-built plan carries none and is rejected, and decoding consumes the planned walk instead of re-deriving it
+  - Add `DataPlan::decode_entry_into`: each read decodes as it lands, into its own disjoint subdivision of the output, so no decode waits on a chunk's slowest read
   - Sync only for now. The reads are the caller's to issue, so the benefit is in how the caller schedules them; an async counterpart can reuse `ReadPlan` and the geometry unchanged
 - Add `ShardingCodecOptions::subchunk_decoder_cache` (default enabled), which keeps inner-chunk partial decoders for the lifetime of a shard's partial decoder
   - Only has an effect when inner chunks are themselves shards, where building a decoder reads that inner shard's own index
