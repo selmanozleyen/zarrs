@@ -48,7 +48,7 @@ pub use codec_traits::bytes_partial_async::{
 
 mod read_plan;
 pub use codec_traits::array_to_bytes::SubchunkGeometry;
-pub use read_plan::{DataPlan, IndexPlan, ReadPlan};
+pub use read_plan::{DataPlan, IndexPlan, PlanState, ReadPlan};
 
 mod recommended_concurrency;
 pub use recommended_concurrency::RecommendedConcurrency;

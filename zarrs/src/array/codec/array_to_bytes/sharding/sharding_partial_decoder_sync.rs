@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use itertools::izip;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use unsafe_cell_slice::UnsafeCellSlice;
 use zarrs_chunk_grid::{ArraySubset, ChunkGridTraits};
-use zarrs_codec::{ArrayToBytesCodecSubchunkingTraits, DataPlan, IndexPlan, SubchunkGeometry};
+use zarrs_codec::{
+    ArrayToBytesCodecSubchunkingTraits, DataPlan, IndexPlan, PlanState, SubchunkGeometry,
+};
 
 use super::{
     ShardingCodecOptions, ShardingIndexLocation, calculate_chunks_per_shard,
@@ -69,80 +71,124 @@ pub struct ShardingPartialDecoder {
     subchunk_indexes: Mutex<HashMap<u64, Arc<[u64]>>>,
 }
 
-/// How one level-zero subchunk is read, which depends on how much of it is wanted.
-enum SubchunkReads {
-    /// Not stored: one entry with nothing to read, decoding to the fill value.
-    Absent,
-    /// Wanted entirely: one entry, the whole encoded subchunk. Its extent is in the outer
-    /// index, so this needs no index of its own and no second stage.
-    Whole(ByteRange),
-    /// Wanted in part: one entry per innermost chunk, which takes this subchunk's own index.
-    /// `base` is where the subchunk starts, since its index counts from there.
-    Innermost {
-        tasks: SubchunkTasks,
-        base: ByteOffset,
-    },
-}
-
-/// One level-zero subchunk's contribution to a nested decode.
-struct NestedSubchunk {
-    /// Which subchunk this is, relative to the shard.
-    chunk_indices: ArrayIndicesTinyVec,
-    /// The part of the selection inside it, in subchunk-local coordinates.
-    subchunk_subset: ArraySubset,
-    reads: SubchunkReads,
-}
-
 /// Whether the selection wants all of a subchunk, so that reading it whole reads nothing
 /// that was not asked for.
 fn wants_whole_subchunk(subchunk_subset: &ArraySubset, subchunk_shape: &[NonZeroU64]) -> bool {
     subchunk_subset.shape() == bytemuck::must_cast_slice::<_, u64>(subchunk_shape)
 }
 
-/// The walk a nested plan describes: the level-zero grid, and the innermost chunks within
-/// each subchunk the selection touches.
+/// One stored unit a plan's reads cover, named by where it decodes to.
 ///
-/// Rebuilt from the cached indexes on both the planning and the decoding side, which is what
-/// lets the flat entry-i-is-bytes-i contract hold when the entries per subchunk vary.
-struct NestedTasks {
-    grid: RegularChunkGrid,
-    subchunks: Vec<NestedSubchunk>,
+/// The unit of a plan is a read, and a read may hold several of these; each one knows
+/// which disjoint subdivision of the output it decodes into (or, when absent, is filled
+/// as).
+#[derive(Clone, Debug)]
+enum RunUnit {
+    /// A level-zero subchunk, decoded whole by the inner codec chain -- which, for a
+    /// subchunk that is itself a shard, is that shard's own partial decoder reading
+    /// from memory.
+    Subchunk(ArrayIndicesTinyVec),
+    /// An innermost chunk of a subchunk the selection wants only part of. Reaching it
+    /// took the subchunk's own index, so this only appears in plans refined from an
+    /// index stage.
+    Innermost {
+        subchunk: ArrayIndicesTinyVec,
+        inner: ArrayIndicesTinyVec,
+    },
 }
 
-impl NestedTasks {
-    /// The reads, in plan order. An absent subchunk keeps one place with nothing to read.
-    fn byte_ranges(&self) -> Vec<Option<ByteRange>> {
-        self.subchunks
-            .iter()
-            .flat_map(|subchunk| match &subchunk.reads {
-                SubchunkReads::Absent => vec![None],
-                SubchunkReads::Whole(range) => vec![Some(*range)],
-                SubchunkReads::Innermost { tasks, base } => tasks
-                    .tasks
-                    .iter()
-                    .map(|task| task.byte_range(*base))
-                    .collect(),
-            })
-            .collect()
-    }
+/// One stored unit and where its bytes live, before runs are built.
+struct Leaf {
+    offset: ByteOffset,
+    length: ByteLength,
+    unit: RunUnit,
+}
 
-    /// How many bytes each read must have brought back, in plan order.
-    fn fetched_lens(&self) -> Vec<Option<usize>> {
-        self.subchunks
-            .iter()
-            .flat_map(|subchunk| match &subchunk.reads {
-                SubchunkReads::Absent => vec![None],
-                SubchunkReads::Whole(range) => vec![match range {
-                    ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => {
-                        Some(usize::try_from(*len).unwrap_or(usize::MAX))
-                    }
-                    ByteRange::FromStart(_, None) => None,
+/// One unit within a run: its bytes sit at `offset..offset + length` of the run's
+/// fetched bytes.
+#[derive(Debug)]
+struct RunMember {
+    offset: ByteOffset,
+    length: ByteLength,
+    unit: RunUnit,
+}
+
+/// One read: a contiguous byte range covering one or more units.
+#[derive(Debug)]
+struct Run {
+    offset: ByteOffset,
+    length: ByteLength,
+    members: Vec<RunMember>,
+}
+
+impl Run {
+    /// The read this run is, in the form a plan reports it.
+    fn range(&self) -> ByteRange {
+        ByteRange::FromStart(self.offset, Some(self.length))
+    }
+}
+
+/// Merge units that are adjacent in the stored value into single reads.
+///
+/// **This is where the order a plan is walked in exists.** Planning reports the runs'
+/// ranges, decoding consumes their members, and neither re-derives the walk -- so
+/// sorting here is the whole ordering story. Strict adjacency only: a gap, however
+/// small, ends the run.
+fn coalesce_leaves(mut leaves: Vec<Leaf>) -> Vec<Run> {
+    leaves.sort_unstable_by_key(|leaf| leaf.offset);
+    let mut runs: Vec<Run> = Vec::new();
+    for leaf in leaves {
+        match runs.last_mut() {
+            Some(run) if run.offset + run.length == leaf.offset => {
+                run.members.push(RunMember {
+                    offset: leaf.offset - run.offset,
+                    length: leaf.length,
+                    unit: leaf.unit,
+                });
+                run.length += leaf.length;
+            }
+            _ => runs.push(Run {
+                offset: leaf.offset,
+                length: leaf.length,
+                members: vec![RunMember {
+                    offset: 0,
+                    length: leaf.length,
+                    unit: leaf.unit,
                 }],
-                SubchunkReads::Innermost { tasks, .. } => {
-                    tasks.tasks.iter().map(SubchunkTask::fetched_len).collect()
-                }
-            })
-            .collect()
+            }),
+        }
+    }
+    runs
+}
+
+/// What a plan's entries are, as the decoder built them: [`PlanState`] for this decoder.
+///
+/// Minted only here, and bound to the decoder that minted it: `minted_by` is checked by
+/// identity on the way back in, so a plan assembled by hand -- even one pairing this
+/// decoder with plausible ranges, or carrying another decoder's state -- is rejected
+/// without rebuilding anything. The payload is still checked, because byte lengths come
+/// from the caller.
+struct ShardingPlanState {
+    /// The decoder that built this state. [`Weak`]: the plan holds the decoder strongly
+    /// already, and this only needs to answer "is it the same one".
+    minted_by: Weak<ShardingPartialDecoder>,
+    /// The selection the runs were computed for.
+    subset: ArraySubset,
+    stage: PlanStage,
+}
+
+enum PlanStage {
+    /// The runs of a data plan, and the units with nothing to read.
+    Data { runs: Vec<Run>, absent: Vec<RunUnit> },
+    /// The runs of an index plan: each member is a subchunk whose index the read holds.
+    Indexes { runs: Vec<Run> },
+}
+
+impl ShardingPlanState {
+    fn runs(&self) -> &[Run] {
+        match &self.stage {
+            PlanStage::Data { runs, .. } | PlanStage::Indexes { runs } => runs,
+        }
     }
 }
 
@@ -415,15 +461,15 @@ impl ShardingPartialDecoder {
     /// The outer index says where the subchunk is; `index_within` says where inside it its
     /// index sits. A [`Suffix`](ByteRange::Suffix) counts from the subchunk's end, which is
     /// why its length is needed to make the range absolute.
-    fn subchunk_index_ranges(
+    fn subchunk_index_leaves(
         &self,
         tasks: &SubchunkTasks,
         subset: &dyn ArraySubsetTraits,
         base: ByteOffset,
         index_within: ByteRange,
-    ) -> Result<Vec<Option<ByteRange>>, CodecError> {
+    ) -> Result<Vec<Leaf>, CodecError> {
         let subset_start = subset.start();
-        let mut ranges = Vec::new();
+        let mut leaves = Vec::new();
         for task in &tasks.tasks {
             let Some((offset, size)) = task.encoded else {
                 continue;
@@ -433,19 +479,18 @@ impl ShardingPartialDecoder {
             if wants_whole_subchunk(&subchunk_subset, &self.subchunk_shape) {
                 continue;
             }
-            ranges.push(Some(match index_within {
-                ByteRange::FromStart(within, Some(len)) => {
-                    ByteRange::FromStart(base + offset + within, Some(len))
-                }
-                ByteRange::FromStart(within, None) => {
-                    ByteRange::FromStart(base + offset + within, Some(size - within))
-                }
-                ByteRange::Suffix(len) => {
-                    ByteRange::FromStart(base + offset + size - len, Some(len))
-                }
-            }));
+            let (index_offset, index_length) = match index_within {
+                ByteRange::FromStart(within, Some(len)) => (base + offset + within, len),
+                ByteRange::FromStart(within, None) => (base + offset + within, size - within),
+                ByteRange::Suffix(len) => (base + offset + size - len, len),
+            };
+            leaves.push(Leaf {
+                offset: index_offset,
+                length: index_length,
+                unit: RunUnit::Subchunk(task.chunk_indices.clone()),
+            });
         }
-        Ok(ranges)
+        Ok(leaves)
     }
 
     /// Whether the selection wants only part of any subchunk that is stored.
@@ -473,16 +518,17 @@ impl ShardingPartialDecoder {
         Ok(false)
     }
 
-    /// The innermost chunks a selection touches, from indexes already read.
+    /// The stored units a nested selection wants, from indexes already read, and the
+    /// units with nothing to read.
     ///
-    /// Every index it needs must be cached, which it is once `refine_read_plan` has run for
-    /// this selection. Without them there is nothing to walk and no read can be performed
-    /// here to get them, so this reports a mismatch rather than reading.
-    fn nested_tasks(
+    /// Every index it needs must be cached, which it is once `refine_index_plan` has run
+    /// for this selection. Without them there is nothing to walk and no read can be
+    /// performed here to get them, so this reports a mismatch rather than reading.
+    fn nested_leaves(
         &self,
         subset: &dyn ArraySubsetTraits,
         base: ByteOffset,
-    ) -> Result<NestedTasks, CodecError> {
+    ) -> Result<(Vec<Leaf>, Vec<RunUnit>), CodecError> {
         let geometry = self.nested_geometry().ok_or(CodecError::ReadPlanMismatch)?;
         let outer = plan_subchunk_tasks(
             &self.shard_shape,
@@ -491,17 +537,22 @@ impl ShardingPartialDecoder {
             subset,
         )?;
         let subset_start = subset.start();
-        let mut subchunks = Vec::with_capacity(outer.tasks.len());
+        let mut leaves = Vec::new();
+        let mut absent = Vec::new();
         for task in &outer.tasks {
             let (subchunk_subset, _) =
                 subchunk_subsets(&outer.grid, subset, &subset_start, &task.chunk_indices)?;
-            let reads = match task.encoded {
-                None => SubchunkReads::Absent,
+            match task.encoded {
+                None => absent.push(RunUnit::Subchunk(task.chunk_indices.clone())),
                 // Wanted whole, so its own index would only tell us to read all of it.
                 Some((offset, size))
                     if wants_whole_subchunk(&subchunk_subset, &self.subchunk_shape) =>
                 {
-                    SubchunkReads::Whole(ByteRange::FromStart(base + offset, Some(size)))
+                    leaves.push(Leaf {
+                        offset: base + offset,
+                        length: size,
+                        unit: RunUnit::Subchunk(task.chunk_indices.clone()),
+                    });
                 }
                 Some((offset, _)) => {
                     let entry = ravel_indices(&task.chunk_indices, &outer.chunks_per_shard)
@@ -513,142 +564,34 @@ impl ShardingPartialDecoder {
                         .get(&entry)
                         .cloned()
                         .ok_or(CodecError::ReadPlanMismatch)?;
-                    let tasks = plan_subchunk_tasks(
+                    let inner_tasks = plan_subchunk_tasks(
                         &self.subchunk_shape,
                         geometry.shape(),
                         Some(&index),
                         &subchunk_subset,
                     )?;
-                    // The base composes: this subchunk starts `offset` into whatever the
-                    // outer base already accounts for.
-                    SubchunkReads::Innermost {
-                        tasks,
-                        base: base + offset,
+                    for inner_task in &inner_tasks.tasks {
+                        match inner_task.encoded {
+                            None => absent.push(RunUnit::Innermost {
+                                subchunk: task.chunk_indices.clone(),
+                                inner: inner_task.chunk_indices.clone(),
+                            }),
+                            // The base composes: this subchunk starts `offset` into
+                            // whatever the outer base already accounts for.
+                            Some((inner_offset, inner_size)) => leaves.push(Leaf {
+                                offset: base + offset + inner_offset,
+                                length: inner_size,
+                                unit: RunUnit::Innermost {
+                                    subchunk: task.chunk_indices.clone(),
+                                    inner: inner_task.chunk_indices.clone(),
+                                },
+                            }),
+                        }
                     }
                 }
-            };
-            subchunks.push(NestedSubchunk {
-                chunk_indices: task.chunk_indices.clone(),
-                subchunk_subset,
-                reads,
-            });
-        }
-        Ok(NestedTasks {
-            grid: outer.grid,
-            subchunks,
-        })
-    }
-
-    /// [`nested_tasks`](Self::nested_tasks), with the plan and its bytes checked against the
-    /// reads this decoder would have reported.
-    fn checked_nested_tasks<'a>(
-        &self,
-        plan: &'a DataPlan,
-        fetched: &[MaybeBytes],
-    ) -> Result<(&'a dyn ArraySubsetTraits, usize, NestedTasks), CodecError> {
-        let Some((subset, data_type_size, base)) = self.planned_subset(plan.subset()) else {
-            return Err(CodecError::ReadPlanMismatch);
-        };
-        let nested = self.nested_tasks(subset, base)?;
-        let ranges = nested.byte_ranges();
-        let lens = nested.fetched_lens();
-        if plan.num_entries() != ranges.len()
-            || fetched.len() != ranges.len()
-            || plan.byte_ranges() != ranges.as_slice()
-            || izip!(fetched, &lens).any(|(bytes, len)| bytes.as_ref().map(Bytes::len) != *len)
-        {
-            return Err(CodecError::ReadPlanMismatch);
-        }
-        Ok((subset, data_type_size, nested))
-    }
-
-    /// Decode innermost chunks the caller fetched into a view of the output.
-    ///
-    /// Two subdivisions deep: one for the subchunk within the selection, one for the
-    /// innermost chunk within the subchunk. The bytes are already here, so each innermost
-    /// chunk decodes from memory.
-    ///
-    /// Serial, unlike the flat path. Nested shards are rare and correctness came first; the
-    /// outer loop is where concurrency would go, since its subdivisions are disjoint.
-    fn nested_decode_from_bytes_into(
-        &self,
-        nested: NestedTasks,
-        array_subset: &dyn ArraySubsetTraits,
-        fetched: Vec<MaybeBytes>,
-        options: &CodecOptions,
-        output_view: &mut ArrayBytesFixedDisjointView<'_>,
-    ) -> Result<(), CodecError> {
-        let geometry = self.nested_geometry().ok_or(CodecError::ReadPlanMismatch)?;
-        let innermost_codecs = geometry.codecs();
-        let innermost_shape = geometry.shape();
-        let fill_value = self.inner_codecs.fill_value();
-        let array_subset_start = array_subset.start();
-
-        let mut rest = fetched.into_iter();
-        for subchunk in nested.subchunks {
-            let (_, output_subset) = subchunk_subsets(
-                &nested.grid,
-                array_subset,
-                &array_subset_start,
-                &subchunk.chunk_indices,
-            )?;
-            let output_subset = output_subset.offset(output_view.subset().start())?;
-            // SAFETY: subchunks represent disjoint array subsets
-            let mut subchunk_view = unsafe { output_view.subdivide(output_subset)? };
-            let tasks = match subchunk.reads {
-                SubchunkReads::Absent => {
-                    // One entry stood for the whole absent subchunk.
-                    let _ = rest.next();
-                    subchunk_view.fill(fill_value.as_ne_bytes())?;
-                    continue;
-                }
-                SubchunkReads::Whole(_) => {
-                    // The whole subchunk came back, so its own decoder reads it from memory
-                    // and takes the part that was wanted.
-                    let encoded = rest.next().ok_or(CodecError::ReadPlanMismatch)?;
-                    let Some(encoded) = encoded else {
-                        subchunk_view.fill(fill_value.as_ne_bytes())?;
-                        continue;
-                    };
-                    self.inner_codecs
-                        .clone()
-                        .partial_decoder(Arc::new(encoded), &self.subchunk_shape, options)?
-                        .partial_decode_into(
-                            &subchunk.subchunk_subset,
-                            ArrayBytesDecodeIntoTarget::Fixed(&mut subchunk_view),
-                            options,
-                        )?;
-                    continue;
-                }
-                SubchunkReads::Innermost { tasks, .. } => tasks,
-            };
-            let inner_start = &subchunk.subchunk_subset.start();
-            for task in &tasks.tasks {
-                let encoded = rest.next().ok_or(CodecError::ReadPlanMismatch)?;
-                let (decode_subset, inner_output) = subchunk_subsets(
-                    &tasks.grid,
-                    &subchunk.subchunk_subset,
-                    inner_start,
-                    &task.chunk_indices,
-                )?;
-                let inner_output = inner_output.offset(subchunk_view.subset().start())?;
-                // SAFETY: innermost chunks represent disjoint array subsets
-                let mut inner_view = unsafe { subchunk_view.subdivide(inner_output)? };
-                let Some(encoded) = encoded else {
-                    inner_view.fill(fill_value.as_ne_bytes())?;
-                    continue;
-                };
-                innermost_codecs
-                    .clone()
-                    .partial_decoder(Arc::new(encoded), innermost_shape, options)?
-                    .partial_decode_into(
-                        &decode_subset,
-                        ArrayBytesDecodeIntoTarget::Fixed(&mut inner_view),
-                        options,
-                    )?;
             }
         }
-        Ok(())
+        Ok((leaves, absent))
     }
 
     /// A subchunk's decoded index, decoding it only the first time it is asked for.
@@ -700,7 +643,7 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         // Where subchunks are subchunked, a subchunk wanted only in part cannot be named
         // yet: the offsets inside it are in an index that has not been read. Name those
         // indexes instead. A selection that wants whole subchunks needs none of this and
-        // falls through -- the ranges below are exactly those subchunks' extents.
+        // falls through -- the reads below are exactly those subchunks' extents.
         if self
             .inner_codecs
             .subchunk_geometry(&self.subchunk_shape)
@@ -708,18 +651,26 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         {
             match self.nested_geometry() {
                 Some(geometry) => {
-                    let index_ranges = self.subchunk_index_ranges(
+                    let index_leaves = self.subchunk_index_leaves(
                         &planned,
                         subset,
                         base,
                         geometry.index_within(),
                     )?;
-                    if !index_ranges.is_empty() {
+                    if !index_leaves.is_empty() {
+                        let runs = coalesce_leaves(index_leaves);
+                        let byte_ranges = runs.iter().map(Run::range).collect();
                         let subset = subset.to_array_subset();
-                        return Ok(Some(ReadPlan::Indexes(IndexPlan::new(
+                        let state = Arc::new(ShardingPlanState {
+                            minted_by: Arc::downgrade(&self),
+                            subset: subset.clone(),
+                            stage: PlanStage::Indexes { runs },
+                        });
+                        return Ok(Some(ReadPlan::Indexes(IndexPlan::new_with_state(
                             self,
                             subset,
-                            index_ranges,
+                            byte_ranges,
+                            state,
                         ))));
                     }
                 }
@@ -735,16 +686,31 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
                 }
             }
         }
-        let byte_ranges = planned
-            .tasks
-            .iter()
-            .map(|task| task.byte_range(base))
-            .collect();
+        let mut leaves = Vec::new();
+        let mut absent = Vec::new();
+        for task in &planned.tasks {
+            match task.encoded {
+                None => absent.push(RunUnit::Subchunk(task.chunk_indices.clone())),
+                Some((offset, size)) => leaves.push(Leaf {
+                    offset: base + offset,
+                    length: size,
+                    unit: RunUnit::Subchunk(task.chunk_indices.clone()),
+                }),
+            }
+        }
+        let runs = coalesce_leaves(leaves);
+        let byte_ranges = runs.iter().map(Run::range).collect();
         let subset = subset.to_array_subset();
-        Ok(Some(ReadPlan::Data(DataPlan::new(
+        let state = Arc::new(ShardingPlanState {
+            minted_by: Arc::downgrade(&self),
+            subset: subset.clone(),
+            stage: PlanStage::Data { runs, absent },
+        });
+        Ok(Some(ReadPlan::Data(DataPlan::new_with_state(
             self,
             subset,
             byte_ranges,
+            state,
         ))))
     }
 
@@ -754,62 +720,71 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         fetched: Vec<MaybeBytes>,
         options: &CodecOptions,
     ) -> Result<DataPlan, CodecError> {
+        let state = self.verified_state(plan.subset(), plan.state(), plan.byte_ranges())?;
+        let PlanStage::Indexes { runs } = &state.stage else {
+            return Err(CodecError::ReadPlanMismatch);
+        };
+        check_fetched_lengths(runs, &fetched)?;
         let Some((subset, _, base)) = self.planned_subset(plan.subset()) else {
             return Err(CodecError::ReadPlanMismatch);
         };
-        let Some(geometry) = self.nested_geometry() else {
+        let chunks_per_shard =
+            calculate_chunks_per_shard(&self.shard_shape, &self.subchunk_shape)?.to_array_shape();
+
+        // Decode each subchunk's index out of the run that holds it, into the cache the
+        // data walk reads from.
+        for (run, bytes) in izip!(runs, &fetched) {
+            let bytes = bytes.as_ref().ok_or(CodecError::ReadPlanMismatch)?;
+            for member in &run.members {
+                let RunUnit::Subchunk(chunk_indices) = &member.unit else {
+                    return Err(CodecError::ReadPlanMismatch);
+                };
+                // In-range: the members subdivide the run, and `bytes` has its length.
+                let start = usize::try_from(member.offset).expect("member within fetched run");
+                let end = usize::try_from(member.offset + member.length)
+                    .expect("member within fetched run");
+                let entry =
+                    ravel_indices(chunk_indices, &chunks_per_shard).expect("inbounds chunk");
+                self.cached_subchunk_index(entry, &bytes[start..end], options)?;
+            }
+        }
+
+        // Built here and consumed by the decode as-is: the walk exists once.
+        let (leaves, absent) = self.nested_leaves(subset, base)?;
+        let runs = coalesce_leaves(leaves);
+        let byte_ranges = runs.iter().map(Run::range).collect();
+        let subset = subset.to_array_subset();
+        let state = Arc::new(ShardingPlanState {
+            minted_by: Arc::downgrade(&self),
+            subset: subset.clone(),
+            stage: PlanStage::Data { runs, absent },
+        });
+        Ok(DataPlan::new_with_state(self, subset, byte_ranges, state))
+    }
+
+    fn fill_absent_into(
+        &self,
+        plan: &DataPlan,
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        _options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        // Checked in the same order as the decode entry points, so the caller gets the
+        // same error whichever runs first.
+        if plan.subset().num_elements() != output_target.num_elements() {
+            return Err(InvalidNumberOfElementsError::new(
+                plan.subset().num_elements(),
+                output_target.num_elements(),
+            )
+            .into());
+        }
+        let ArrayBytesDecodeIntoTarget::Fixed(output_view) = output_target else {
+            return Err(ExpectedFixedLengthBytesError.into());
+        };
+        let state = self.verified_state(plan.subset(), plan.state(), plan.byte_ranges())?;
+        let PlanStage::Data { absent, .. } = &state.stage else {
             return Err(CodecError::ReadPlanMismatch);
         };
-        let outer = plan_subchunk_tasks(
-            &self.shard_shape,
-            &self.subchunk_shape,
-            self.shard_index.as_deref(),
-            subset,
-        )?;
-        // The same checks a returned data plan gets: the reads this decoder would have
-        // reported, and bytes of the length each asked for.
-        let expected = self.subchunk_index_ranges(&outer, subset, base, geometry.index_within())?;
-        if plan.num_entries() != expected.len()
-            || fetched.len() != expected.len()
-            || plan.byte_ranges() != expected.as_slice()
-            || izip!(&expected, &fetched).any(|(range, bytes)| {
-                let wanted = range.and_then(|range| match range {
-                    ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => {
-                        Some(usize::try_from(len).unwrap_or(usize::MAX))
-                    }
-                    ByteRange::FromStart(_, None) => None,
-                });
-                bytes.as_ref().map(Bytes::len) != wanted
-            })
-        {
-            return Err(CodecError::ReadPlanMismatch);
-        }
-
-        // Decode each index in the order it was reported, which is the order the subchunks
-        // wanted in part appear in.
-        let subset_start = subset.start();
-        let mut indexes = fetched.into_iter();
-        for task in &outer.tasks {
-            let Some((_, _)) = task.encoded else { continue };
-            let (subchunk_subset, _) =
-                subchunk_subsets(&outer.grid, subset, &subset_start, &task.chunk_indices)?;
-            if wants_whole_subchunk(&subchunk_subset, &self.subchunk_shape) {
-                continue;
-            }
-            let encoded = indexes
-                .next()
-                .flatten()
-                .ok_or(CodecError::ReadPlanMismatch)?;
-            let entry = ravel_indices(&task.chunk_indices, &outer.chunks_per_shard)
-                .expect("inbounds chunk");
-            self.cached_subchunk_index(entry, &encoded, options)?;
-        }
-
-        // Built by the same walk the decode will rebuild, so the two cannot disagree.
-        let nested = self.nested_tasks(subset, base)?;
-        let byte_ranges = nested.byte_ranges();
-        let subset = subset.to_array_subset();
-        Ok(DataPlan::new(self, subset, byte_ranges))
+        self.fill_absent_units(absent, plan.subset(), output_view)
     }
 
     fn partial_decode_from_bytes(
@@ -818,14 +793,16 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         fetched: Vec<MaybeBytes>,
         options: &CodecOptions,
     ) -> Result<ArrayBytes<'_>, CodecError> {
-        let (subset, data_type_size, planned, nested) = if self.nested_geometry().is_some() {
-            let (subset, size, nested) = self.checked_nested_tasks(plan, &fetched)?;
-            (subset, size, None, Some(nested))
-        } else {
-            let (subset, size, planned) = self.checked_tasks(plan, &fetched)?;
-            (subset, size, Some(planned), None)
+        let state = self.verified_state(plan.subset(), plan.state(), plan.byte_ranges())?;
+        let PlanStage::Data { runs, absent } = &state.stage else {
+            return Err(CodecError::ReadPlanMismatch);
         };
+        check_fetched_lengths(runs, &fetched)?;
+        let (_, data_type_size, _) = self
+            .planned_subset(plan.subset())
+            .ok_or(CodecError::ReadPlanMismatch)?;
 
+        let subset = plan.subset();
         let array_shape = subset.shape();
         let mut out = vec![0; subset.num_elements_usize() * data_type_size];
         let out_slice = UnsafeCellSlice::new(out.as_mut_slice());
@@ -837,25 +814,9 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
                 ArraySubset::new_with_shape(array_shape.to_vec()),
             )?
         };
-        match (planned, nested) {
-            (_, Some(nested)) => self.nested_decode_from_bytes_into(
-                nested,
-                subset,
-                fetched,
-                options,
-                &mut output_view,
-            )?,
-            (Some(planned), None) => partial_decode_fixed_array_subset_from_bytes_into(
-                &self.subchunk_shape,
-                &self.inner_codecs,
-                planned,
-                subset,
-                fetched,
-                options,
-                &mut output_view,
-            )?,
-            (None, None) => return Err(CodecError::ReadPlanMismatch),
-        }
+        // The buffer is this call's own, so nothing else will fill the absent units.
+        self.fill_absent_units(absent, subset, &mut output_view)?;
+        self.decode_runs_into(runs, subset, fetched, options, &mut output_view)?;
         Ok(ArrayBytes::from(out))
     }
 
@@ -880,71 +841,204 @@ impl ArrayPartialDecoderPlanned for ShardingPartialDecoder {
         let ArrayBytesDecodeIntoTarget::Fixed(output_view) = output_target else {
             return Err(ExpectedFixedLengthBytesError.into());
         };
-        // Straight into the caller's view: the inner chunks already decode into subdivisions
-        // of whatever view they are given, so there is nothing for an owned buffer to do.
-        if self.nested_geometry().is_some() {
-            let (subset, _, nested) = self.checked_nested_tasks(plan, &fetched)?;
-            return self.nested_decode_from_bytes_into(
-                nested,
-                subset,
-                fetched,
-                options,
-                output_view,
-            );
-        }
-        let (_, _, planned) = self.checked_tasks(plan, &fetched)?;
-        partial_decode_fixed_array_subset_from_bytes_into(
-            &self.subchunk_shape,
-            &self.inner_codecs,
-            planned,
-            plan.subset(),
-            fetched,
-            options,
-            output_view,
-        )
+        let state = self.verified_state(plan.subset(), plan.state(), plan.byte_ranges())?;
+        let PlanStage::Data { runs, .. } = &state.stage else {
+            return Err(CodecError::ReadPlanMismatch);
+        };
+        check_fetched_lengths(runs, &fetched)?;
+        // Straight into the caller's view, and only what was read: the absent units are
+        // `fill_absent_into`'s, called once by the caller.
+        self.decode_runs_into(runs, plan.subset(), fetched, options, output_view)
     }
 }
 
+/// Whether each run's bytes are exactly as long as the run asked for.
+///
+/// Sharding only ever plans exact ranges, so this is the whole check on what came back:
+/// bytes of another length are not the bytes the run asked for, and every entry is a
+/// read, so [`None`] never matches.
+fn check_fetched_lengths(runs: &[Run], fetched: &[MaybeBytes]) -> Result<(), CodecError> {
+    if fetched.len() != runs.len()
+        || izip!(runs, fetched).any(|(run, bytes)| {
+            bytes.as_ref().map(Bytes::len)
+                != Some(usize::try_from(run.length).unwrap_or(usize::MAX))
+        })
+    {
+        return Err(CodecError::ReadPlanMismatch);
+    }
+    Ok(())
+}
+
 impl ShardingPartialDecoder {
-    /// The geometry a plan describes, once the plan and the bytes fetched for it have been
-    /// checked against the reads this decoder would perform.
+    /// The plan's state, if it is state this decoder minted and the plan is unaltered.
     ///
-    /// Rebuilding the plan is cheap -- the shard index is resident, and the decode needs the
-    /// geometry anyway -- so both decode entry points check: one entry per inner chunk, the
-    /// same range for each, and bytes of the length that range asks for. The plan holding
-    /// this decoder is what pairs it to the right decoder; the ranges still need checking
-    /// because plans are publicly constructible.
+    /// The seam validation splits along: the *structure* -- which units each read holds,
+    /// and where each decodes to -- is trusted because it is provably this decoder's own
+    /// work, checked by identity rather than by rebuilding the walk. The *payload* is
+    /// still checked, because byte lengths come from the caller. The identity check is
+    /// what makes a hand-built plan impossible: state is minted only by planning, a plan
+    /// built through the public constructors carries none, and state lifted from another
+    /// decoder's plan upgrades to that decoder, not this one.
     ///
-    /// What this cannot catch is a permutation of entries whose ranges are all the same
-    /// length, which is the usual case for uncompressed inner chunks. Order is the caller's
-    /// side of the contract.
-    fn checked_tasks<'a>(
+    /// The ranges are compared too -- cheap, both sides resident -- so genuine state
+    /// cannot be re-paired with edited public ranges, which are what the caller fetched.
+    ///
+    /// What none of this can catch is a permutation of fetched bytes whose runs are all
+    /// the same length. Order is the caller's side of the contract.
+    fn verified_state<'a>(
         &self,
-        plan: &'a DataPlan,
-        fetched: &[MaybeBytes],
-    ) -> Result<(&'a dyn ArraySubsetTraits, usize, SubchunkTasks), CodecError> {
-        // A selection this decoder does not plan -- nested sharding, a variable-size
-        // type -- cannot have produced this plan, so something else did.
-        let Some((subset, data_type_size, base)) = self.planned_subset(plan.subset()) else {
-            return Err(CodecError::ReadPlanMismatch);
-        };
-        let planned = plan_subchunk_tasks(
-            &self.shard_shape,
-            &self.subchunk_shape,
-            self.shard_index.as_deref(),
-            subset,
-        )?;
-        let tasks = &planned.tasks;
-        if fetched.len() != tasks.len()
-            || plan.num_entries() != tasks.len()
-            || izip!(plan.byte_ranges(), fetched, tasks).any(|(range, bytes, task)| {
-                *range != task.byte_range(base)
-                    || bytes.as_ref().map(Bytes::len) != task.fetched_len()
-            })
+        subset: &ArraySubset,
+        state: Option<&'a dyn PlanState>,
+        byte_ranges: &[ByteRange],
+    ) -> Result<&'a ShardingPlanState, CodecError> {
+        let state = state
+            .and_then(|state| state.as_any().downcast_ref::<ShardingPlanState>())
+            .ok_or(CodecError::ReadPlanMismatch)?;
+        let minted_here = state
+            .minted_by
+            .upgrade()
+            // The plan itself keeps its decoder alive, so if this state was minted by
+            // the decoder now consuming it, the upgrade cannot fail.
+            .is_some_and(|minter| std::ptr::eq(Arc::as_ptr(&minter), self));
+        let runs = state.runs();
+        if !minted_here
+            || state.subset != *subset
+            || byte_ranges.len() != runs.len()
+            || izip!(byte_ranges, runs).any(|(range, run)| *range != run.range())
         {
             return Err(CodecError::ReadPlanMismatch);
         }
-        Ok((subset, data_type_size, planned))
+        Ok(state)
+    }
+
+    /// Fill the output subdivisions of units with nothing to read.
+    fn fill_absent_units(
+        &self,
+        absent: &[RunUnit],
+        subset: &ArraySubset,
+        output_view: &mut ArrayBytesFixedDisjointView<'_>,
+    ) -> Result<(), CodecError> {
+        let fill_value = self.inner_codecs.fill_value();
+        for unit in absent {
+            let output_subset = self.unit_output_subset(unit, subset)?.1;
+            let output_subset = output_subset.offset(output_view.subset().start())?;
+            // SAFETY: units represent disjoint array subsets
+            let mut unit_view = unsafe { output_view.subdivide(output_subset)? };
+            unit_view.fill(fill_value.as_ne_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Where one unit decodes from and to: the subset to decode from the unit, in the
+    /// unit's own coordinates, and where those elements land, relative to `subset`'s
+    /// start.
+    fn unit_output_subset(
+        &self,
+        unit: &RunUnit,
+        subset: &ArraySubset,
+    ) -> Result<(ArraySubset, ArraySubset), CodecError> {
+        let subset_start = subset.start();
+        let outer_grid = RegularChunkGrid::new(
+            bytemuck::must_cast_slice(&self.shard_shape).to_vec(),
+            self.subchunk_shape.to_vec(),
+        )
+        .map_err(Into::<IncompatibleDimensionalityError>::into)?;
+        match unit {
+            RunUnit::Subchunk(chunk_indices) => {
+                subchunk_subsets(&outer_grid, subset, &subset_start, chunk_indices)
+            }
+            RunUnit::Innermost { subchunk, inner } => {
+                let geometry = self.nested_geometry().ok_or(CodecError::ReadPlanMismatch)?;
+                let (subchunk_subset, subchunk_output) =
+                    subchunk_subsets(&outer_grid, subset, &subset_start, subchunk)?;
+                let inner_grid = RegularChunkGrid::new(
+                    bytemuck::must_cast_slice(&self.subchunk_shape).to_vec(),
+                    geometry.shape().to_vec(),
+                )
+                .map_err(Into::<IncompatibleDimensionalityError>::into)?;
+                let (decode_subset, inner_output) = subchunk_subsets(
+                    &inner_grid,
+                    &subchunk_subset,
+                    &subchunk_subset.start(),
+                    inner,
+                )?;
+                Ok((
+                    decode_subset,
+                    inner_output.offset(subchunk_output.start())?,
+                ))
+            }
+        }
+    }
+
+    /// Decode fetched runs into a view of the output, each member from its slice of the
+    /// run's bytes.
+    ///
+    /// `fetched` has already been checked one-to-one against `runs`. Members decode
+    /// concurrently across runs -- they are disjoint subdivisions of the output, exactly
+    /// as the per-chunk path's chunks are.
+    fn decode_runs_into(
+        &self,
+        runs: &[Run],
+        subset: &ArraySubset,
+        fetched: Vec<MaybeBytes>,
+        options: &CodecOptions,
+        output_view: &mut ArrayBytesFixedDisjointView<'_>,
+    ) -> Result<(), CodecError> {
+        let chunks_per_shard =
+            calculate_chunks_per_shard(&self.shard_shape, &self.subchunk_shape)?.to_array_shape();
+        let (concurrent_limit, options) = super::get_concurrent_target_and_codec_options(
+            &self.inner_codecs,
+            &self.subchunk_shape,
+            &chunks_per_shard,
+            options,
+        )?;
+
+        // A member decodes from its slice of the run's bytes: `Bytes` is a handle, so
+        // slicing shares the fetched buffer rather than copying it.
+        let members: Vec<(&RunMember, Bytes)> = izip!(runs, fetched)
+            .flat_map(|(run, bytes)| {
+                let bytes = bytes.expect("checked against the run");
+                run.members.iter().map(move |member| {
+                    // In-range: the members subdivide the run, and `bytes` has its length.
+                    let start =
+                        usize::try_from(member.offset).expect("member within fetched run");
+                    let end = usize::try_from(member.offset + member.length)
+                        .expect("member within fetched run");
+                    (member, bytes.slice(start..end))
+                })
+            })
+            .collect();
+
+        let geometry = self.nested_geometry();
+        let decode_member = |(member, encoded): (&RunMember, Bytes)| {
+            let (decode_subset, output_subset) = self.unit_output_subset(&member.unit, subset)?;
+            let output_subset = output_subset.offset(output_view.subset().start())?;
+            // SAFETY: units represent disjoint array subsets
+            let mut unit_view = unsafe { output_view.subdivide(output_subset)? };
+            let unit_decoder = match &member.unit {
+                RunUnit::Subchunk(_) => self.inner_codecs.clone().partial_decoder(
+                    Arc::new(encoded),
+                    &self.subchunk_shape,
+                    &options,
+                )?,
+                RunUnit::Innermost { .. } => {
+                    let geometry = geometry.as_ref().ok_or(CodecError::ReadPlanMismatch)?;
+                    geometry.codecs().clone().partial_decoder(
+                        Arc::new(encoded),
+                        geometry.shape(),
+                        &options,
+                    )?
+                }
+            };
+            unit_decoder.partial_decode_into(
+                &decode_subset,
+                ArrayBytesDecodeIntoTarget::Fixed(&mut unit_view),
+                &options,
+            )
+        };
+
+        crate::iter_concurrent_limit!(concurrent_limit, members, try_for_each, decode_member)?;
+        Ok(())
     }
 
     /// The array subset a read plan can be built for and the size of one of its
@@ -987,27 +1081,6 @@ struct SubchunkTask {
     encoded: Option<(ByteOffset, ByteLength)>,
     /// Which inner chunk this is, relative to the shard.
     chunk_indices: ArrayIndicesTinyVec,
-}
-
-impl SubchunkTask {
-    /// The read this task performs, in the form a [`ReadPlan`] reports it.
-    ///
-    /// `base` is where the decoder's input handle begins in the stored value; the shard
-    /// index counts from the handle, and a plan counts from the store.
-    fn byte_range(&self, base: ByteOffset) -> Option<ByteRange> {
-        self.encoded
-            .map(|(offset, size)| ByteRange::FromStart(base + offset, Some(size)))
-    }
-
-    /// How many bytes must have been fetched for this task, if any.
-    ///
-    /// Sharding only ever plans an exact range, so this is the whole check on what came
-    /// back: bytes of another length are not the bytes this task asked for.
-    fn fetched_len(&self) -> Option<usize> {
-        // A size beyond `usize` cannot have been fetched into memory, so nothing matches.
-        self.encoded
-            .map(|(_, size)| usize::try_from(size).unwrap_or(usize::MAX))
-    }
 }
 
 /// The inner chunks a fixed-size array subset decode touches, and the grid they are
@@ -1112,73 +1185,6 @@ fn subchunk_subsets(
         overlap.relative_to(chunk_subset.start())?,
         overlap.relative_to(array_subset_start)?,
     ))
-}
-
-/// The supplied-bytes twin of [`partial_decode_fixed_array_subset_into`]: the same
-/// tasks, but each inner chunk decodes from bytes the caller supplied rather than
-/// from a byte interval of the input handle.
-///
-/// `fetched` must be one-to-one with `planned.tasks`; the caller has already checked that.
-fn partial_decode_fixed_array_subset_from_bytes_into(
-    subchunk_shape: &[NonZeroU64],
-    inner_codecs: &Arc<CodecChainBound>,
-    planned: SubchunkTasks,
-    array_subset: &dyn ArraySubsetTraits,
-    fetched: Vec<MaybeBytes>,
-    options: &CodecOptions,
-    output_view: &mut ArrayBytesFixedDisjointView<'_>,
-) -> Result<(), CodecError> {
-    let fill_value = inner_codecs.fill_value();
-    let SubchunkTasks {
-        grid,
-        chunks_per_shard,
-        tasks,
-    } = planned;
-    let (subchunk_concurrent_limit, options) = super::get_concurrent_target_and_codec_options(
-        inner_codecs,
-        subchunk_shape,
-        &chunks_per_shard,
-        options,
-    )?;
-
-    let array_subset_start = array_subset.start();
-    let decode_subchunk = |(task, encoded): (SubchunkTask, MaybeBytes)| {
-        let (decode_subset, output_subset) = subchunk_subsets(
-            &grid,
-            array_subset,
-            &array_subset_start,
-            &task.chunk_indices,
-        )?;
-        let output_subset = output_subset.offset(output_view.subset().start())?;
-        // SAFETY: chunks represent disjoint array subsets
-        let mut subchunk_view: ArrayBytesFixedDisjointView<'_> =
-            unsafe { output_view.subdivide(output_subset)? };
-        let Some(encoded) = encoded else {
-            return subchunk_view
-                .fill(fill_value.as_ne_bytes())
-                .map_err(CodecError::from);
-        };
-        // The bytes are already here, so the inner decoder reads from memory. They go in
-        // as the store returned them: `Bytes` is a handle, and cloning it into the
-        // decoder does not copy the buffer.
-        let inner_partial_decoder =
-            inner_codecs
-                .clone()
-                .partial_decoder(Arc::new(encoded), subchunk_shape, &options)?;
-        inner_partial_decoder.partial_decode_into(
-            &decode_subset,
-            ArrayBytesDecodeIntoTarget::Fixed(&mut subchunk_view),
-            &options,
-        )
-    };
-
-    crate::iter_concurrent_limit!(
-        subchunk_concurrent_limit,
-        tasks.into_iter().zip(fetched).collect::<Vec<_>>(),
-        try_for_each,
-        decode_subchunk
-    )?;
-    Ok(())
 }
 
 fn get_subchunk_partial_decoder(
