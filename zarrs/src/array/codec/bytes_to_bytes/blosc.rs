@@ -205,6 +205,31 @@ fn blosc_nbytes(src: &[u8]) -> Option<usize> {
     (uncompressed_bytes > 0 && cbytes > 0 && blocksize > 0).then_some(uncompressed_bytes)
 }
 
+/// Returns the internal block size of a `blosc` buffer.
+///
+/// The block is the unit `blosc` actually decompresses. `blosc1_getitem` decompresses
+/// every block a requested range touches, whatever the size of that range, so this is
+/// what a partial decode is really charged in. It is read from the 16 byte header and
+/// costs no decompression.
+///
+/// # Safety
+///
+/// Validate first
+fn blosc_blocksize(src: &[u8]) -> Option<usize> {
+    let mut uncompressed_bytes: usize = 0;
+    let mut cbytes: usize = 0;
+    let mut blocksize: usize = 0;
+    unsafe {
+        blosc_cbuffer_sizes(
+            src.as_ptr().cast::<c_void>(),
+            &raw mut uncompressed_bytes,
+            &raw mut cbytes,
+            &raw mut blocksize,
+        );
+    };
+    (uncompressed_bytes > 0 && cbytes > 0 && blocksize > 0).then_some(blocksize)
+}
+
 fn blosc_decompress_bytes(
     src: &[u8],
     destsize: usize,
