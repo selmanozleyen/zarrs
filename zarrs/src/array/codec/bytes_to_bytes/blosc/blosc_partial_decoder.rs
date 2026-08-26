@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     blosc_blocksize, blosc_decompress_bytes, blosc_decompress_bytes_partial, blosc_typesize,
@@ -41,6 +42,40 @@ fn blocks_charged(
     charged
 }
 
+/// How often the gate is reached, and how often it has anything to decide.
+///
+/// Whether it fires is not something to infer from a wall clock: a gate that is never
+/// reached and a gate that is reached and declines look identical from outside. These
+/// separate the two. `multi` is the one that matters -- with one region per call the
+/// comparison is settled before it starts, since one region can never cost more blocks
+/// than decoding every block once.
+static GATE_CALLS: AtomicU64 = AtomicU64::new(0);
+static GATE_REGIONS: AtomicU64 = AtomicU64::new(0);
+static GATE_MULTI: AtomicU64 = AtomicU64::new(0);
+static GATE_WHOLE: AtomicU64 = AtomicU64::new(0);
+
+fn gate_count(n_regions: usize, decode_whole: bool) {
+    let calls = GATE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    GATE_REGIONS.fetch_add(n_regions as u64, Ordering::Relaxed);
+    if n_regions > 1 {
+        GATE_MULTI.fetch_add(1, Ordering::Relaxed);
+    }
+    if decode_whole {
+        GATE_WHOLE.fetch_add(1, Ordering::Relaxed);
+    }
+    // The first call says the path is reached at all; the rest is a running total, rare
+    // enough that the reporting cannot itself be the cost.
+    if calls == 1 || calls % 1_000_000 == 0 {
+        eprintln!(
+            "zarrs-blosc-block-dedup: {calls} calls, {} regions, {} calls with >1 region, \
+             {} buffers decoded whole",
+            GATE_REGIONS.load(Ordering::Relaxed),
+            GATE_MULTI.load(Ordering::Relaxed),
+            GATE_WHOLE.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// Serve `decoded_regions` from one `blosc` buffer, decoding it whole when that is cheaper.
 ///
 /// Decoding the whole buffer costs every block exactly once; serving the regions one by
@@ -69,6 +104,8 @@ fn blosc_partial_decode<'a>(
         let n_blocks = nbytes.div_ceil(blocksize);
         blocks_charged(&regions, nbytes, blocksize, n_blocks) > n_blocks
     });
+
+    gate_count(regions.len(), decode_whole);
 
     if decode_whole {
         // One thread, matching `BloscCodec::decode`: the concurrency belongs to the
