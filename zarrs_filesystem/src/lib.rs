@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
-use direct_io::{MetadataExt, OpenOptionsExt, O_DIRECT};
+use direct_io::{OpenOptionsExt, O_DIRECT};
 
 // // Register the store.
 // inventory::submit! {
@@ -94,7 +94,7 @@ impl FilesystemStoreOptions {
     /// A read that races a write of the same key (which this store does not support, see
     /// [`FilesystemStore`]) may cache a handle for the pre-write file, which is then served to
     /// subsequent reads until it is evicted.
-    /// This option has no effect on reads with [`direct_io`](Self::direct_io) enabled.
+    /// With [`direct_io`](Self::direct_io) enabled, the cached handles are opened with `O_DIRECT`.
     pub fn file_handle_cache_size(&mut self, file_handle_cache_size: usize) -> &mut Self {
         self.file_handle_cache_size = file_handle_cache_size;
         self
@@ -217,7 +217,19 @@ impl FilesystemStore {
             }
         }
 
-        let file = match RandomAccessFile::open(self.key_to_fspath(key)) {
+        let path = self.key_to_fspath(key);
+        // Direct I/O reads go through the same cache, so a read does not reopen its file.
+        #[cfg(target_os = "linux")]
+        let file = if self.options.direct_io {
+            let mut flags = OpenOptions::new();
+            flags.read(true).custom_flags(O_DIRECT);
+            flags.open(path).and_then(RandomAccessFile::try_new)
+        } else {
+            RandomAccessFile::open(path)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let file = RandomAccessFile::open(path);
+        let file = match file {
             Ok(file) => file,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -326,23 +338,12 @@ impl FilesystemStore {
         byte_ranges: ByteRangeIterator<'a>,
     ) -> Result<MaybeBytesIterator<'a>, StorageError> {
         use std::collections::BTreeMap;
-        use std::os::unix::fs::FileExt;
 
-        // Open the file
-        let mut flags = OpenOptions::new();
-        flags.read(true);
-        flags.custom_flags(O_DIRECT);
-        let file = match flags.open(self.key_to_fspath(key)) {
-            Ok(file) => file,
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    return Ok(None);
-                }
-                return Err(err.into());
-            }
+        // Open the file (or reuse a cached handle, opened with O_DIRECT)
+        let Some(handle) = self.open_or_cached(key)? else {
+            return Ok(None);
         };
-
-        let file_size: u64 = file.metadata()?.size();
+        let file_size = handle.size;
         let ps = page_size::get() as u64;
 
         // Find intersected pages
@@ -362,7 +363,7 @@ impl FilesystemStore {
                 let buf = unsafe {
                     std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), length)
                 };
-                FileExt::read_at(&file, buf, offset as u64)?
+                handle.file.read_at(offset, buf)?
             };
             unsafe {
                 buf.set_len(bytes_read);
