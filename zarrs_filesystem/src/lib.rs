@@ -218,12 +218,13 @@ impl FilesystemStore {
         }
 
         let path = self.key_to_fspath(key);
-        // Direct I/O reads go through the same cache, so a read does not reopen its file.
         #[cfg(target_os = "linux")]
         let file = if self.options.direct_io {
-            let mut flags = OpenOptions::new();
-            flags.read(true).custom_flags(O_DIRECT);
-            flags.open(path).and_then(RandomAccessFile::try_new)
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECT)
+                .open(path)
+                .and_then(RandomAccessFile::try_new)
         } else {
             RandomAccessFile::open(path)
         };
@@ -339,7 +340,7 @@ impl FilesystemStore {
     ) -> Result<MaybeBytesIterator<'a>, StorageError> {
         use std::collections::BTreeMap;
 
-        // Open the file (or reuse a cached handle, opened with O_DIRECT)
+        // Open the file
         let Some(handle) = self.open_or_cached(key)? else {
             return Ok(None);
         };
